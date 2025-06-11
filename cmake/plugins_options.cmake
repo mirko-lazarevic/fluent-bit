@@ -121,6 +121,7 @@ DEFINE_OPTION(FLB_OUT_FLOWCOUNTER             "Enable flowcount output plugin"  
 DEFINE_OPTION(FLB_OUT_FORWARD                 "Enable Forward output plugin"                 ON)
 DEFINE_OPTION(FLB_OUT_GELF                    "Enable GELF output plugin"                    ON)
 DEFINE_OPTION(FLB_OUT_HTTP                    "Enable HTTP output plugin"                    ON)
+DEFINE_OPTION(FLB_OUT_IBM_LOGS                "Enable IBM Cloud Logs output plugin"          ON)
 DEFINE_OPTION(FLB_OUT_INFLUXDB                "Enable InfluxDB output plugin"                ON)
 DEFINE_OPTION(FLB_OUT_KAFKA                   "Enable Kafka output plugin"                   ON)
 DEFINE_OPTION(FLB_OUT_KAFKA_REST              "Enable Kafka Rest output plugin"              ON)
