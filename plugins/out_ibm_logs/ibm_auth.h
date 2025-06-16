@@ -28,13 +28,29 @@
 
 #define IBM_IAM_API_KEY         "IBM_IAM_API_KEY"
 
-#define IBM_IAM_CT              "Content-Type"
-#define IBM_IAM_CT_JSON         "application/x-www-form-urlencoded; charset=UTF-8"
-
+/* Token refresh threshold (5 minutes before expiry) */
+#define TOKEN_REFRESH_THRESHOLD  300
 
 #include <fluent-bit/flb_output_plugin.h>
 #include "ibm_logs.h"
 
-int ibm_get_token(struct flb_ibm_logs *ctx, struct flb_config *config);
+/* Authentication context stored in global(plugin) arena */
+struct ibm_auth_context {
+    char *bearer_token;
+    time_t token_expiry;
+    char *iam_endpoint;
+
+    /* OAuth2 payload components (pre-allocated) */
+    char *grant_type;
+    size_t grant_type_len;
+    char *auth_value;      /* API key or profile ID */
+    size_t auth_value_len;
+    char *cr_token_path;   /* For trusted profile */
+};
+
+int ibm_auth_init(struct flb_ibm_logs *ctx);
+int ibm_auth_get_token(struct flb_ibm_logs *ctx, struct flb_config *config);
+int ibm_auth_refresh_if_needed(struct flb_ibm_logs *ctx, struct flb_config *config);
+void ibm_auth_cleanup(struct flb_ibm_logs *ctx);
 
 #endif
