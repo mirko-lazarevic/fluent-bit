@@ -149,15 +149,15 @@ static int cb_ibm_logs_init(struct flb_output_instance *ins,
     //     }
     // }
 
-    if (!ctx->subsystem_name) {
-        ctx->subsystem_name = flb_sds_create(DEFAULT_SUBSYSTEM_NAME);
-        if (!ctx->subsystem_name) {
-            flb_plg_error(ctx->ins, "failed to allocate default subsystem name");
-            goto error;
-        } else {
-            flb_plg_debug(ctx->ins, "default subsystem name has been set");
-        }
-    }
+    // if (!ctx->subsystem_name) {
+    //     ctx->subsystem_name = flb_sds_create(DEFAULT_SUBSYSTEM_NAME);
+    //     if (!ctx->subsystem_name) {
+    //         flb_plg_error(ctx->ins, "failed to allocate default subsystem name");
+    //         goto error;
+    //     } else {
+    //         flb_plg_debug(ctx->ins, "default subsystem name has been set");
+    //     }
+    // }
 
     /* create upstream connection context */
     upstream = flb_upstream_create(config,
@@ -226,83 +226,326 @@ error:
 
 }
 
-
-/* Extract application name from various sources */
-static inline void extract_application_name(struct flb_ibm_logs *ctx,
-                                           msgpack_object *kubernetes_map,
-                                           const char *file_path,
-                                           int file_path_len,
-                                           flb_sds_t *app_name)
+/* Extract namespace from Kubernetes log file path
+ * Format: /var/log/containers/<pod>_<namespace>_<container-name>-<container-id>.log
+ * Returns: newly allocated string or NULL on failure
+ */
+static char* parse_namespace_from_path(struct flb_ibm_logs *ctx, 
+                                       const char *file_path, 
+                                       int file_path_len)
 {
-    /* Try to get from Kubernetes metadata namespace_name */
-    if (kubernetes_map && kubernetes_map->via.map.ptr) {
-        flb_plg_debug(ctx->ins, "kubernete_map->via.map.ptr != null");
-        for (int j = 0; j < kubernetes_map->via.map.size; j++) {
-            msgpack_object kk = kubernetes_map->via.map.ptr[j].key;
-            msgpack_object vv = kubernetes_map->via.map.ptr[j].val;
-            
-            if (kk.type == MSGPACK_OBJECT_STR && kk.via.str.size == 14 &&
-                memcmp(kk.via.str.ptr, "namespace_name", 14) == 0) {
-                if (vv.type == MSGPACK_OBJECT_STR) {
-                    *app_name = flb_sds_create_len(vv.via.str.ptr, vv.via.str.size);
-                    if (!app_name) {
-                        flb_plg_error(ctx->ins, "failed to allocate application name from 'namespace_name'");
-                    } else {
-                        flb_plg_debug(ctx->ins, "application name set from 'namespace_name'");
-                    }
-                    return;
-                }
+    const char *containers_prefix = "/var/log/containers/";
+    const int prefix_len = 20; /* strlen("/var/log/containers/") */
+    char *namespace_start;
+    char *namespace_end;
+    int namespace_len;
+    char *result;
+    
+    /* Validate input */
+    if (!file_path || file_path_len <= prefix_len) {
+        return NULL;
+    }
+    
+    /* Check if path starts with expected prefix */
+    if (strncmp(file_path, containers_prefix, prefix_len) != 0) {
+        return NULL;
+    }
+    
+    /* Find first underscore after prefix (end of pod name) */
+    namespace_start = memchr(file_path + prefix_len, '_', 
+                             file_path_len - prefix_len);
+    if (!namespace_start) {
+        return NULL;
+    }
+    namespace_start++; /* Move past the underscore */
+    
+    /* Find second underscore (end of namespace) */
+    namespace_end = memchr(namespace_start, '_', 
+                          file_path_len - (namespace_start - file_path));
+    if (!namespace_end) {
+        return NULL;
+    }
+    
+    namespace_len = namespace_end - namespace_start;
+    if (namespace_len <= 0 || namespace_len > 253) { /* K8s namespace max length */
+        return NULL;
+    }
+    
+    /* Allocate and copy namespace */
+    result = flb_sds_create_len(namespace_start, namespace_len);
+    if (!result) {
+        flb_plg_error(ctx->ins, "Failed to allocate namespace from path");
+    }
+    
+    return result;
+}
+
+/* Extract container name from Kubernetes log file path
+ * Format: /var/log/containers/<pod>_<namespace>_<container-name>-<container-id>.log
+ * Container name is between the second '_' and the LAST '-' before .log
+ * Returns: newly allocated string or NULL on failure
+ */
+static char* parse_container_from_path(struct flb_ibm_logs *ctx,
+                                       const char *file_path,
+                                       int file_path_len)
+{
+    const char *containers_prefix = "/var/log/containers/";
+    const int prefix_len = 20; /* strlen("/var/log/containers/") */
+    const char *log_suffix = ".log";
+    const int suffix_len = 4; /* strlen(".log") */
+    char *container_start;
+    char *container_end;
+    char *last_hyphen;
+    int container_len;
+    char *result;
+    int underscore_count = 0;
+    int i;
+    
+    /* Validate input */
+    if (!file_path || file_path_len <= (prefix_len + suffix_len)) {
+        return NULL;
+    }
+    
+    /* Check if path starts with expected prefix */
+    if (strncmp(file_path, containers_prefix, prefix_len) != 0) {
+        return NULL;
+    }
+    
+    /* Check if path ends with .log */
+    if (strncmp(file_path + file_path_len - suffix_len, log_suffix, suffix_len) != 0) {
+        return NULL;
+    }
+    
+    /* Find the second underscore (after pod and namespace) */
+    container_start = (char *)(file_path + prefix_len);
+    for (i = 0; i < file_path_len - prefix_len; i++) {
+        if (container_start[i] == '_') {
+            underscore_count++;
+            if (underscore_count == 2) {
+                container_start = &container_start[i + 1];
+                break;
             }
         }
     }
-
-    /* use default */
-    *app_name = flb_sds_create(DEFAULT_APP_NAME);
-    if (!app_name) {
-        flb_plg_error(ctx->ins, "failed to allocate default application name");
+    
+    if (underscore_count != 2) {
+        return NULL;
+    }
+    
+    /* Find the LAST hyphen before .log extension
+     * This separates container name from container ID
+     * We search backwards from the .log extension
+     */
+    last_hyphen = NULL;
+    for (i = file_path_len - suffix_len - 1; i >= (container_start - file_path); i--) {
+        if (file_path[i] == '-') {
+            last_hyphen = (char *)&file_path[i];
+            break;
+        }
+    }
+    
+    if (!last_hyphen || last_hyphen <= container_start) {
+        /* No hyphen found or hyphen is before container start */
+        return NULL;
+    }
+    
+    container_end = last_hyphen;
+    container_len = container_end - container_start;
+    
+    /* Validate container name length */
+    if (container_len <= 0 || container_len > 253) { /* Reasonable max length */
+        return NULL;
+    }
+    
+    /* Additional validation: container name should not be just the container ID
+     * Container IDs are typically 64 character hex strings
+     * A valid container name with hyphens should be shorter or non-hex
+     */
+    if (container_len == 64) {
+        /* Check if it's all hex characters (likely a container ID without name) */
+        int is_hex = 1;
+        for (i = 0; i < container_len; i++) {
+            char c = container_start[i];
+            if (!((c >= '0' && c <= '9') || 
+                  (c >= 'a' && c <= 'f') || 
+                  (c >= 'A' && c <= 'F'))) {
+                is_hex = 0;
+                break;
+            }
+        }
+        if (is_hex) {
+            /* Looks like a container ID without a name prefix */
+            flb_plg_debug(ctx->ins, 
+                         "Path appears to contain only container ID without name");
+            return NULL;
+        }
+    }
+    
+    /* Allocate and copy container name */
+    result = flb_sds_create_len(container_start, container_len);
+    if (!result) {
+        flb_plg_error(ctx->ins, "Failed to allocate container name from path");
     } else {
-        flb_plg_debug(ctx->ins, "default application name has been set");
+        flb_plg_debug(ctx->ins, 
+                     "Parsed container name from path: '%s' (length: %d)", 
+                     result, container_len);
+    }
+    
+    return result;
+}
+
+/* Extract application name from various sources following priority order:
+ * 1. User configuration (handled by caller)
+ * 2. Kubernetes metadata namespace_name
+ * 3. Parsed from file path
+ * 4. Default value
+ */
+static void extract_application_name(struct flb_ibm_logs *ctx,
+                                    msgpack_object *kubernetes_map,
+                                    const char *file_path,
+                                    int file_path_len,
+                                    flb_sds_t *app_name)
+{
+    int j;
+    msgpack_object k;
+    msgpack_object v;
+    char *parsed_namespace = NULL;
+    
+    /* Ensure output pointer is valid */
+    if (!app_name) {
+        flb_plg_error(ctx->ins, "Invalid app_name pointer");
+        return;
+    }
+    
+    /* Initialize to NULL */
+    *app_name = NULL;
+    
+    /* Priority 1: Configuration - handled by caller */
+    
+    /* Priority 2: Try Kubernetes metadata namespace_name */
+    if (kubernetes_map && kubernetes_map->type == MSGPACK_OBJECT_MAP) {
+        for (j = 0; j < kubernetes_map->via.map.size; j++) {
+            k = kubernetes_map->via.map.ptr[j].key;
+            v = kubernetes_map->via.map.ptr[j].val;
+            
+            if (k.type == MSGPACK_OBJECT_STR && 
+                k.via.str.size == 14 &&
+                memcmp(k.via.str.ptr, "namespace_name", 14) == 0) {
+                
+                if (v.type == MSGPACK_OBJECT_STR && v.via.str.size > 0) {
+                    *app_name = flb_sds_create_len(v.via.str.ptr, v.via.str.size);
+                    if (*app_name) {
+                        flb_plg_debug(ctx->ins, 
+                                     "Application name set from namespace_name: %s", 
+                                     *app_name);
+                        return;
+                    }
+                    flb_plg_error(ctx->ins, 
+                                 "Failed to allocate application name from namespace_name");
+                }
+                break; /* namespace_name found but invalid/allocation failed */
+            }
+        }
+    }
+    
+    /* Priority 3: Try parsing from file path */
+    if (file_path && file_path_len > 0) {
+        parsed_namespace = parse_namespace_from_path(ctx, file_path, file_path_len);
+        if (parsed_namespace) {
+            *app_name = parsed_namespace;
+            flb_plg_debug(ctx->ins, 
+                         "Application name parsed from file path: %s", 
+                         *app_name);
+            return;
+        }
+    }
+    
+    /* Priority 4: Fall back to default */
+    *app_name = flb_sds_create(DEFAULT_APP_NAME);
+    if (!*app_name) {
+        flb_plg_error(ctx->ins, "Critical: Failed to allocate default application name");
+        /* This is a critical error - the caller should check for NULL */
+    } else {
+        flb_plg_debug(ctx->ins, "Using default application name: %s", *app_name);
     }
 }
 
-/* Extract subsystem name from various sources */
-static inline void extract_subsystem_name(struct flb_ibm_logs *ctx,
-                                         msgpack_object *kubernetes_map,
-                                         const char *file_path,
-                                         int file_path_len,
-                                         flb_sds_t *subsystem_name)
+/* Extract subsystem name from various sources following priority order:
+ * 1. User configuration (handled by caller)
+ * 2. Kubernetes annotations container_name
+ * 3. Parsed from file path
+ * 4. Default value
+ */
+static void extract_subsystem_name(struct flb_ibm_logs *ctx,
+                                  msgpack_object *kubernetes_map,
+                                  const char *file_path,
+                                  int file_path_len,
+                                  flb_sds_t *subsystem_name)
 {
-    /* Try to get from Kubernetes annotations */
-    if (kubernetes_map && kubernetes_map->via.map.ptr) {
-        msgpack_object *annotations_map = NULL;
-        for (int j = 0; j < kubernetes_map->via.map.size; j++) {
-            msgpack_object kk = kubernetes_map->via.map.ptr[j].key;
-            msgpack_object vv = kubernetes_map->via.map.ptr[j].val;
-            if (kk.type == MSGPACK_OBJECT_STR && kk.via.str.size == 11 &&
-                memcmp(kk.via.str.ptr, "annotations", 11) == 0) {
-                if (vv.type == MSGPACK_OBJECT_MAP) {
-                    annotations_map = &vv;
-                    break;
-                }
-            }
-        }
-        if (annotations_map && annotations_map->via.map.ptr) {
-            for (int j = 0; j < annotations_map->via.map.size; j++) {
-                msgpack_object kk = annotations_map->via.map.ptr[j].key;
-                msgpack_object vv = annotations_map->via.map.ptr[j].val;
-                if (kk.type == MSGPACK_OBJECT_STR && kk.via.str.size == 13 &&
-                    memcmp(kk.via.str.ptr, "container_name", 13) == 0) {
-                    if (vv.type == MSGPACK_OBJECT_STR) {
-                        *subsystem_name = flb_sds_create_len(vv.via.str.ptr, vv.via.str.size);
+    msgpack_object *annotations_map = NULL;
+    int j;
+    msgpack_object k;
+    msgpack_object v;
+    char *parsed_container = NULL;
+    
+    /* Ensure output pointer is valid */
+    if (!subsystem_name) {
+        flb_plg_error(ctx->ins, "Invalid subsystem_name pointer");
+        return;
+    }
+    
+    /* Initialize to NULL */
+    *subsystem_name = NULL;
+    
+    /* Priority 1: Configuration - handled by caller */
+    
+    /* Priority 2: Try Kubernetes metadata container_name */
+    if (kubernetes_map && kubernetes_map->type == MSGPACK_OBJECT_MAP) {
+        for (j = 0; j < kubernetes_map->via.map.size; j++) {
+            k = kubernetes_map->via.map.ptr[j].key;
+            v = kubernetes_map->via.map.ptr[j].val;
+            
+            if (k.type == MSGPACK_OBJECT_STR && 
+                k.via.str.size == 14 &&
+                memcmp(k.via.str.ptr, "container_name", 14) == 0) {
+                
+                if (v.type == MSGPACK_OBJECT_STR && v.via.str.size > 0) {
+                    *subsystem_name = flb_sds_create_len(v.via.str.ptr, 
+                                                            v.via.str.size);
+                    if (*subsystem_name) {
+                        flb_plg_debug(ctx->ins, 
+                                        "Subsystem name set from container_name: %s", 
+                                        *subsystem_name);
                         return;
                     }
+                    flb_plg_error(ctx->ins, 
+                                    "Failed to allocate subsystem name from container_name");
                 }
+                break; /* container_name found but invalid/allocation failed */
             }
         }
     }
-
-    /* use default */
-    *subsystem_name = ctx->subsystem_name;
+    
+    /* Priority 3: Try parsing from file path */
+    if (file_path && file_path_len > 0) {
+        parsed_container = parse_container_from_path(ctx, file_path, file_path_len);
+        if (parsed_container) {
+            *subsystem_name = parsed_container;
+            flb_plg_debug(ctx->ins, 
+                         "Subsystem name parsed from file path: %s", 
+                         *subsystem_name);
+            return;
+        }
+    }
+    
+    /* Priority 4: Fall back to default */
+    *subsystem_name = flb_sds_create(DEFAULT_SUBSYSTEM_NAME);
+    if (!*subsystem_name) {
+        flb_plg_error(ctx->ins, "Critical: Failed to allocate default subsystem name");
+        /* This is a critical error - the caller should check for NULL */
+    } else {
+        flb_plg_debug(ctx->ins, "Using default subsystem name: %s", *subsystem_name);
+    }
 }
 
 static int count_logs_with_threshold(size_t last_offset, size_t threshold,
@@ -355,6 +598,8 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
 
     flb_sds_t app_name_to_use = NULL;
     flb_sds_t subsystem_name_to_use = NULL;
+    int should_free_app_name = 0;
+    int should_free_subsystem_name = 0;
     
     struct flb_log_event log_event;
 
@@ -392,24 +637,32 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
         const char *file_path = NULL;
         int file_path_len = 0;
         
+        /* Reset per-iteration variables */
+        app_name_to_use = NULL;
+        subsystem_name_to_use = NULL;
+        should_free_app_name = 0;
+        should_free_subsystem_name = 0;
+        
         /* Count additional fields we'll include */
         for (i = 0; i < log_event.body->via.map.size; i++) {
             k = log_event.body->via.map.ptr[i].key;
             v = log_event.body->via.map.ptr[i].val;
 
             /* Check for kubernetes metadata */
-            if (k.via.str.size == 10 && memcmp(k.via.str.ptr, "kubernetes", 10) == 0) {
+            if (k.type == MSGPACK_OBJECT_STR &&
+                k.via.str.size == 10 && 
+                memcmp(k.via.str.ptr, "kubernetes", 10) == 0) {
                 if (v.type == MSGPACK_OBJECT_MAP) {
                     kubernetes_map = &v;
-                    flb_plg_debug(ctx->ins, "kubernetes map found");
                 }
             }
             /* Check for file field */
-            else if (k.via.str.size == 4 && memcmp(k.via.str.ptr, "file", 4) == 0) {
+            else if (k.type == MSGPACK_OBJECT_STR &&
+                     k.via.str.size == 4 && 
+                     memcmp(k.via.str.ptr, "file", 4) == 0) {
                 if (v.type == MSGPACK_OBJECT_STR) {
                     file_path = v.via.str.ptr;
                     file_path_len = v.via.str.size;
-                    flb_plg_debug(ctx->ins, "file found");
                 }
             }
 
@@ -435,31 +688,54 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
 
         /* Required fields */
         
-        /* applicationName - use namespace name from Kubemetadata or default */
+        /* applicationName - use configured value or extract from metadata/path */
         msgpack_pack_str(&mp_pck, 15);
         msgpack_pack_str_body(&mp_pck, "applicationName", 15);
 
-        if (!ctx->application_name) {
-            flb_plg_debug(ctx->ins, "\napplication name not provided, figuring out one ...");
-            extract_application_name(ctx, kubernetes_map, file_path, file_path_len,
-                                 &app_name_to_use);
-            msgpack_pack_str(&mp_pck, flb_sds_len(app_name_to_use));
-            msgpack_pack_str_body(&mp_pck, app_name_to_use, flb_sds_len(app_name_to_use));
-        } else {
+        if (ctx->application_name) {
+            app_name_to_use = ctx->application_name;
             flb_plg_debug(ctx->ins, "application name is provided from the config");
-            msgpack_pack_str(&mp_pck, flb_sds_len(ctx->application_name));
-            msgpack_pack_str_body(&mp_pck, ctx->application_name, flb_sds_len(ctx->application_name));
+        } else {
+            extract_application_name(ctx, kubernetes_map, file_path, file_path_len,
+                                    &app_name_to_use);
+            should_free_app_name = 1;
+            
+            /* Check for allocation failure */
+            if (!app_name_to_use) {
+                flb_plg_error(ctx->ins, "Failed to extract application name");
+                goto error;
+            }
+            flb_plg_debug(ctx->ins, "application name=%s", app_name_to_use);
         }
         
-        /* subsystemName - use container_name from Kubernetes metadata or default */
+        msgpack_pack_str(&mp_pck, flb_sds_len(app_name_to_use));
+        msgpack_pack_str_body(&mp_pck, app_name_to_use, flb_sds_len(app_name_to_use));
+        
+        /* subsystemName - use configured value or extract from metadata/path */
         msgpack_pack_str(&mp_pck, 13);
         msgpack_pack_str_body(&mp_pck, "subsystemName", 13);
 
-        // extract_subsystem_name(ctx, kubernetes_map, file_path, file_path_len,
-        //                         &subsystem_name_to_use);
-
-        msgpack_pack_str(&mp_pck, flb_sds_len(ctx->subsystem_name));
-        msgpack_pack_str_body(&mp_pck, ctx->subsystem_name, flb_sds_len(ctx->subsystem_name));
+        if (ctx->subsystem_name) {
+            subsystem_name_to_use = ctx->subsystem_name;
+            flb_plg_debug(ctx->ins, "subsystem name is provided from the config");
+        } else {
+            extract_subsystem_name(ctx, kubernetes_map, file_path, file_path_len,
+                                  &subsystem_name_to_use);
+            should_free_subsystem_name = 1;
+            
+            /* Check for allocation failure */
+            if (!subsystem_name_to_use) {
+                flb_plg_error(ctx->ins, "Failed to extract subsystem name");
+                if (should_free_app_name && app_name_to_use) {
+                    flb_sds_destroy(app_name_to_use);
+                }
+                goto error;
+            }
+            flb_plg_debug(ctx->ins, "subsystem name=%s", subsystem_name_to_use);
+        }
+        
+        msgpack_pack_str(&mp_pck, flb_sds_len(subsystem_name_to_use));
+        msgpack_pack_str_body(&mp_pck, subsystem_name_to_use, flb_sds_len(subsystem_name_to_use));
 
         /* text - the actual log message */
         msgpack_pack_str(&mp_pck, 4);
@@ -498,6 +774,16 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
                 }
             }
         }
+        
+        /* Free dynamically allocated names if needed */
+        if (should_free_app_name && app_name_to_use) {
+            flb_sds_destroy(app_name_to_use);
+            app_name_to_use = NULL;
+        }
+        if (should_free_subsystem_name && subsystem_name_to_use) {
+            flb_sds_destroy(subsystem_name_to_use);
+            subsystem_name_to_use = NULL;
+        }
 
         if (off >= (threshold + last_offset)) {
             flb_plg_debug(ctx->ins,
@@ -517,21 +803,17 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
     }
 
     msgpack_sbuffer_destroy(&mp_sbuf);
-    if (app_name_to_use != ctx->application_name) {
-        flb_sds_destroy(app_name_to_use);
-    }
-    if (subsystem_name_to_use != ctx->subsystem_name) {
-        flb_sds_destroy(subsystem_name_to_use);
-    }
 
     return json;
 
 error:
     msgpack_sbuffer_destroy(&mp_sbuf);
-    if (app_name_to_use != ctx->application_name) {
+    
+    /* Clean up any remaining allocations */
+    if (should_free_app_name && app_name_to_use) {
         flb_sds_destroy(app_name_to_use);
     }
-    if (subsystem_name_to_use != ctx->subsystem_name) {
+    if (should_free_subsystem_name && subsystem_name_to_use) {
         flb_sds_destroy(subsystem_name_to_use);
     }
 
