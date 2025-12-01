@@ -29,17 +29,22 @@
 #define IBM_IAM_API_KEY         "IBM_IAM_API_KEY"
 
 /* Token refresh threshold (5 minutes before expiry) */
-#define TOKEN_REFRESH_THRESHOLD  300
+#define TOKEN_REFRESH_THRESHOLD_SECONDS  300
+#define TOKEN_EXPIRY_SECONDS             3600
+
+/* String literal lengths for security */
+#define GRANT_TYPE_APIKEY_LEN    31
+#define GRANT_TYPE_CR_TOKEN_LEN  34
 
 #include <fluent-bit/flb_output_plugin.h>
 #include "ibm_logs.h"
 
-/* Authentication context stored in global(plugin) arena */
+/* Authentication context */
 struct ibm_auth_context {
     char *bearer_token;
     time_t token_expiry;
     char *iam_endpoint;
-
+    
     /* OAuth2 payload components (pre-allocated) */
     char *grant_type;
     size_t grant_type_len;

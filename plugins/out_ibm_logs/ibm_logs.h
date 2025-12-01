@@ -29,24 +29,42 @@
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_sds.h>
 
-#include "arena.h"
-
-/* Arena sizes */
-#define GLOBAL_ARENA_SIZE    (64 * 1024)     /* 64KB for global arena */
-#define TEMP_ARENA_SIZE      (256 * 1024)    /* 256KB for temporary arena */
-
-/* Pre-allocated buffer sizes */
-// #define MAX_LOG_BUFFER_SIZE  (16 * 1024)     /* 16KB per log entry */
-// #define MAX_BATCH_SIZE       100              /* Max logs per batch */
-
+/* Token and buffer sizes */
 #define MAX_TOKEN_SIZE       (8 * 1024)      /* 8KB for bearer token */
 #define MAX_CR_TOKEN_SIZE    (16 * 1024)     /* 16KB for CR token */
+#define MAX_API_KEY_SIZE     (512)           /* Reasonable API key size limit */
+#define MAX_PROFILE_ID_SIZE  (256)           /* Profile ID size limit */
 
+/* Default values */
 #define DEFAULT_APP_NAME "ibm-application-name-not-found"
 #define DEFAULT_SUBSYSTEM_NAME "ibm-subsystem-name-not-found"
 
+/* Kubernetes constants */
+#define K8S_NAMESPACE_MAX_LEN 253
+#define K8S_CONTAINER_MAX_LEN 253
+#define K8S_CONTAINER_ID_LEN  64
+#define K8S_LOG_PATH_PREFIX   "/var/log/containers/"
+#define K8S_LOG_PATH_PREFIX_LEN 20
+#define K8S_LOG_SUFFIX        ".log"
+#define K8S_LOG_SUFFIX_LEN    4
+
+/* Field name constants */
+#define FIELD_KUBERNETES      "kubernetes"
+#define FIELD_KUBERNETES_LEN  10
+#define FIELD_NAMESPACE_NAME  "namespace_name"
+#define FIELD_NAMESPACE_NAME_LEN 14
+#define FIELD_CONTAINER_NAME  "container_name"
+#define FIELD_CONTAINER_NAME_LEN 14
+#define FIELD_FILE           "file"
+#define FIELD_FILE_LEN       4
+
+/* HTTP constants */
+#define HTTP_PAYLOAD_THRESHOLD_MB  1.6
+#define HTTP_PAYLOAD_MAX_MB        2.0
+#define HTTP_RETRY_LIMIT           8
+#define HTTP_RETRY_REDUCTION_FACTOR 0.1
+
 struct flb_ibm_logs {
-    
     int       ibm_logs_port;
     flb_sds_t ibm_logs_host;
     flb_sds_t ibm_logs_path;
@@ -58,7 +76,7 @@ struct flb_ibm_logs {
     /* Mutex for thread-safe token access */
     pthread_mutex_t auth_mutex;
 
-    /* Authentication context (allocated from global arena) */
+    /* Authentication context */
     struct ibm_auth_context *auth;
 
     flb_sds_t ibm_iam_authentication_mode;
@@ -66,15 +84,9 @@ struct flb_ibm_logs {
     flb_sds_t ibm_iam_trusted_profile_id;
     flb_sds_t cr_token_mount_path;
 
-    char *cr_token_buffer;     /* Buffer for CR token reading */
+    char *cr_token_buffer;
 
-    /* Global arena for persistent allocations */
-    struct arena global_arena;
-
-    /* Temporary arena for per-flush allocations */
-    struct arena temp_arena;
-
-    /* upstream connection to the IBM Cloud Logs endpoint */
+    /* Upstream connection */
     struct flb_upstream *upstream;
 
     /* Statistics */

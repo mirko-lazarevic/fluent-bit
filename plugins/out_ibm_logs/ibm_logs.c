@@ -26,12 +26,33 @@
 #include "ibm_logs.h"
 #include "ibm_auth.h"
 
+/* Field mapping structure for efficiency */
+struct field_mapping {
+    const char *name;
+    size_t name_len;
+    const char *mapped_name;
+    size_t mapped_name_len;
+};
+
+static const struct field_mapping FIELD_MAPPINGS[] = {
+    {"level", 5, "severity", 8},
+    {"severity", 8, "severity", 8},
+    {"computerName", 12, "computerName", 12},
+    {"category", 8, "category", 8},
+    {"className", 9, "className", 9},
+    {"methodName", 10, "methodName", 10},
+    {"threadId", 8, "threadId", 8}
+};
+
+#define FIELD_MAPPINGS_COUNT (sizeof(FIELD_MAPPINGS) / sizeof(FIELD_MAPPINGS[0]))
+
 int flb_ibm_logs_conf_destroy(struct flb_ibm_logs *ctx)
 {
     if (!ctx) {
         return -1;
     }
 
+    /* Destroy string fields */
     if (ctx->ibm_logs_host) {
         flb_sds_destroy(ctx->ibm_logs_host);
     }
@@ -52,7 +73,7 @@ int flb_ibm_logs_conf_destroy(struct flb_ibm_logs *ctx)
         flb_upstream_destroy(ctx->upstream);
     }
 
-    /* Destroy mutex if it was initialized */
+    /* Destroy mutex */
     pthread_mutex_destroy(&ctx->auth_mutex);
 
     flb_free(ctx);
@@ -69,7 +90,7 @@ static int cb_ibm_logs_init(struct flb_output_instance *ins,
 
     flb_plg_debug(ins, "initializing IBM Cloud Logs output plugin");
 
-    /* allocate config context */
+    /* Allocate config context */
     ctx = flb_calloc(1, sizeof(struct flb_ibm_logs));
     if (!ctx) {
         flb_plg_error(ins, "configuration failed");
@@ -77,7 +98,7 @@ static int cb_ibm_logs_init(struct flb_output_instance *ins,
     }
     ctx->ins = ins;
 
-    /* initialize mutex  */
+    /* Initialize mutex */
     ret = pthread_mutex_init(&ctx->auth_mutex, NULL);
     if (ret != 0) {
         flb_plg_error(ins, "failed to initialize auth mutex: %s", strerror(ret));
@@ -85,53 +106,34 @@ static int cb_ibm_logs_init(struct flb_output_instance *ins,
         return -1;
     }
 
-    /* initialize global(plugin) arena */
-    ret = arena_init(&ctx->global_arena, GLOBAL_ARENA_SIZE);
-    if (ret != 0) {
-        flb_plg_error(ins, "failed to initialize global arena");
-        flb_free(ctx);
-        return -1;
-    }
-
-    /* initialize temporary arena */
-    ret = arena_init(&ctx->temp_arena, TEMP_ARENA_SIZE);
-    if (ret != 0) {
-        flb_plg_error(ins, "failed to initialize temporary arena");
-        arena_destroy(&ctx->global_arena);
-        flb_free(ctx);
-        return -1;
-    }
-
-    /* load config map */
+    /* Load config map */
     ret = flb_output_config_map_set(ins, (void *) ctx);
     if (ret == -1) {
         goto error;
     }
 
-    /* validate mandatory properties */
-
-    // validate port
+    /* Validate port */
     if (ctx->ibm_logs_port <= 0 || ctx->ibm_logs_port > 65535) {
         flb_plg_error(ctx->ins, "invalid port number: %d", ctx->ibm_logs_port);
         goto error;
     }
 
-    // validate host
+    /* Validate host */
     if (!ctx->ibm_logs_host || strlen(ctx->ibm_logs_host) == 0) {
         flb_plg_error(ctx->ins, "host cannot be empty");
         goto error;
     }
 
-    // validate authentication mode
+    /* Validate authentication mode */
     if (strcmp(ctx->ibm_iam_authentication_mode, IBM_AUTH_MODE_APIKEY) != 0 &&
         strcmp(ctx->ibm_iam_authentication_mode, IBM_AUTH_MODE_TRUSTED_PROFILE) != 0) {
         flb_plg_error(ctx->ins, "invalid authentication mode: %s",
                       ctx->ibm_iam_authentication_mode);
-        return -1;
+        goto error;
     }
 
-    /* set default value for path if not provided */
-    if(!ctx->ibm_logs_path) {
+    /* Set default path if not provided */
+    if (!ctx->ibm_logs_path) {
         ctx->ibm_logs_path = flb_sds_create(FLB_IBM_LOGS_PATH);
         if (!ctx->ibm_logs_path) {
             flb_plg_error(ctx->ins, "failed to allocate default ibm logs path");
@@ -139,27 +141,7 @@ static int cb_ibm_logs_init(struct flb_output_instance *ins,
         }
     }
 
-    /* set default values for application_name and subsystem_name if not provided */
-    /* TODO */
-    // if (!ctx->application_name) {
-    //     ctx->application_name = flb_sds_create(DEFAULT_APP_NAME);
-    //     if (!ctx->application_name) {
-    //         flb_plg_error(ctx->ins, "failed to allocate default application name");
-    //         goto error;
-    //     }
-    // }
-
-    // if (!ctx->subsystem_name) {
-    //     ctx->subsystem_name = flb_sds_create(DEFAULT_SUBSYSTEM_NAME);
-    //     if (!ctx->subsystem_name) {
-    //         flb_plg_error(ctx->ins, "failed to allocate default subsystem name");
-    //         goto error;
-    //     } else {
-    //         flb_plg_debug(ctx->ins, "default subsystem name has been set");
-    //     }
-    // }
-
-    /* create upstream connection context */
+    /* Create upstream connection context */
     upstream = flb_upstream_create(config,
                                    ctx->ibm_logs_host,
                                    ctx->ibm_logs_port,
@@ -173,9 +155,8 @@ static int cb_ibm_logs_init(struct flb_output_instance *ins,
     ctx->upstream = upstream;
     flb_output_upstream_set(ctx->upstream, ins);
 
-
-    /* Pre-allocate token buffers */
-    ctx->cr_token_buffer = arena_alloc(&ctx->global_arena, MAX_CR_TOKEN_SIZE);
+    /* Pre-allocate CR token buffer */
+    ctx->cr_token_buffer = flb_calloc(1, MAX_CR_TOKEN_SIZE);
     if (!ctx->cr_token_buffer) {
         flb_plg_error(ins, "failed to allocate CR token buffer");
         goto error;
@@ -195,69 +176,51 @@ static int cb_ibm_logs_init(struct flb_output_instance *ins,
         goto error;
     }
 
-
-    /* export context */
+    /* Export context */
     flb_output_set_context(ins, ctx);
 
-    /*
-     * This plugin instance uses the HTTP client interface, let's register
-     * it debugging callbacks.
-     */
+    /* Register debugging callbacks */
     flb_output_set_http_debug_callbacks(ins);
 
-    flb_plg_info(ctx->ins, "plugin configured port=%d host=%s", ctx->ibm_logs_port, ctx->ibm_logs_host);
-
-    /* Log arena statistics */
-    size_t used, available;
-    arena_stats(&ctx->global_arena, &used, &available);
-
-    flb_plg_info(ins, "global arena: %zu bytes used, %zu bytes available",
-                 used, available);
+    flb_plg_info(ctx->ins, "plugin configured port=%d host=%s", 
+                 ctx->ibm_logs_port, ctx->ibm_logs_host);
 
     flb_plg_info(ins, "IBM Cloud Logs plugin initialized successfully");
 
     return 0;
 
 error:
-    arena_destroy(&ctx->temp_arena);
-    arena_destroy(&ctx->global_arena);
     flb_ibm_logs_conf_destroy(ctx);
     return -1;
-
 }
 
-/* Extract namespace from Kubernetes log file path
- * Format: /var/log/containers/<pod>_<namespace>_<container-name>-<container-id>.log
- * Returns: newly allocated string or NULL on failure
- */
+/* Secure namespace extraction from Kubernetes log path */
 static char* parse_namespace_from_path(struct flb_ibm_logs *ctx, 
                                        const char *file_path, 
                                        int file_path_len)
 {
-    const char *containers_prefix = "/var/log/containers/";
-    const int prefix_len = 20; /* strlen("/var/log/containers/") */
-    char *namespace_start;
-    char *namespace_end;
+    const char *namespace_start;
+    const char *namespace_end;
     int namespace_len;
     char *result;
     
     /* Validate input */
-    if (!file_path || file_path_len <= prefix_len) {
+    if (!file_path || file_path_len <= K8S_LOG_PATH_PREFIX_LEN) {
         return NULL;
     }
     
-    /* Check if path starts with expected prefix */
-    if (strncmp(file_path, containers_prefix, prefix_len) != 0) {
+    /* Check prefix */
+    if (memcmp(file_path, K8S_LOG_PATH_PREFIX, K8S_LOG_PATH_PREFIX_LEN) != 0) {
         return NULL;
     }
     
-    /* Find first underscore after prefix (end of pod name) */
-    namespace_start = memchr(file_path + prefix_len, '_', 
-                             file_path_len - prefix_len);
+    /* Find first underscore (end of pod name) */
+    namespace_start = memchr(file_path + K8S_LOG_PATH_PREFIX_LEN, '_', 
+                             file_path_len - K8S_LOG_PATH_PREFIX_LEN);
     if (!namespace_start) {
         return NULL;
     }
-    namespace_start++; /* Move past the underscore */
+    namespace_start++;
     
     /* Find second underscore (end of namespace) */
     namespace_end = memchr(namespace_start, '_', 
@@ -267,7 +230,7 @@ static char* parse_namespace_from_path(struct flb_ibm_logs *ctx,
     }
     
     namespace_len = namespace_end - namespace_start;
-    if (namespace_len <= 0 || namespace_len > 253) { /* K8s namespace max length */
+    if (namespace_len <= 0 || namespace_len > K8S_NAMESPACE_MAX_LEN) {
         return NULL;
     }
     
@@ -280,21 +243,13 @@ static char* parse_namespace_from_path(struct flb_ibm_logs *ctx,
     return result;
 }
 
-/* Extract container name from Kubernetes log file path
- * Format: /var/log/containers/<pod>_<namespace>_<container-name>-<container-id>.log
- * Container name is between the second '_' and the LAST '-' before .log
- * Returns: newly allocated string or NULL on failure
- */
+/* Secure container name extraction from Kubernetes log path */
 static char* parse_container_from_path(struct flb_ibm_logs *ctx,
                                        const char *file_path,
                                        int file_path_len)
 {
-    const char *containers_prefix = "/var/log/containers/";
-    const int prefix_len = 20; /* strlen("/var/log/containers/") */
-    const char *log_suffix = ".log";
-    const int suffix_len = 4; /* strlen(".log") */
-    char *container_start;
-    char *container_end;
+    const char *container_start;
+    const char *container_end;
     char *last_hyphen;
     int container_len;
     char *result;
@@ -302,23 +257,23 @@ static char* parse_container_from_path(struct flb_ibm_logs *ctx,
     int i;
     
     /* Validate input */
-    if (!file_path || file_path_len <= (prefix_len + suffix_len)) {
+    if (!file_path || file_path_len <= (K8S_LOG_PATH_PREFIX_LEN + K8S_LOG_SUFFIX_LEN)) {
         return NULL;
     }
     
-    /* Check if path starts with expected prefix */
-    if (strncmp(file_path, containers_prefix, prefix_len) != 0) {
+    /* Check prefix and suffix */
+    if (memcmp(file_path, K8S_LOG_PATH_PREFIX, K8S_LOG_PATH_PREFIX_LEN) != 0) {
         return NULL;
     }
     
-    /* Check if path ends with .log */
-    if (strncmp(file_path + file_path_len - suffix_len, log_suffix, suffix_len) != 0) {
+    if (memcmp(file_path + file_path_len - K8S_LOG_SUFFIX_LEN, 
+               K8S_LOG_SUFFIX, K8S_LOG_SUFFIX_LEN) != 0) {
         return NULL;
     }
     
-    /* Find the second underscore (after pod and namespace) */
-    container_start = (char *)(file_path + prefix_len);
-    for (i = 0; i < file_path_len - prefix_len; i++) {
+    /* Find the second underscore */
+    container_start = (char *)(file_path + K8S_LOG_PATH_PREFIX_LEN);
+    for (i = 0; i < file_path_len - K8S_LOG_PATH_PREFIX_LEN; i++) {
         if (container_start[i] == '_') {
             underscore_count++;
             if (underscore_count == 2) {
@@ -332,12 +287,10 @@ static char* parse_container_from_path(struct flb_ibm_logs *ctx,
         return NULL;
     }
     
-    /* Find the LAST hyphen before .log extension
-     * This separates container name from container ID
-     * We search backwards from the .log extension
-     */
+    /* Find last hyphen before .log */
     last_hyphen = NULL;
-    for (i = file_path_len - suffix_len - 1; i >= (container_start - file_path); i--) {
+    for (i = file_path_len - K8S_LOG_SUFFIX_LEN - 1; 
+         i >= (container_start - file_path); i--) {
         if (file_path[i] == '-') {
             last_hyphen = (char *)&file_path[i];
             break;
@@ -345,7 +298,6 @@ static char* parse_container_from_path(struct flb_ibm_logs *ctx,
     }
     
     if (!last_hyphen || last_hyphen <= container_start) {
-        /* No hyphen found or hyphen is before container start */
         return NULL;
     }
     
@@ -353,16 +305,12 @@ static char* parse_container_from_path(struct flb_ibm_logs *ctx,
     container_len = container_end - container_start;
     
     /* Validate container name length */
-    if (container_len <= 0 || container_len > 253) { /* Reasonable max length */
+    if (container_len <= 0 || container_len > K8S_CONTAINER_MAX_LEN) {
         return NULL;
     }
     
-    /* Additional validation: container name should not be just the container ID
-     * Container IDs are typically 64 character hex strings
-     * A valid container name with hyphens should be shorter or non-hex
-     */
-    if (container_len == 64) {
-        /* Check if it's all hex characters (likely a container ID without name) */
+    /* Check if it's just a container ID (64 hex chars) */
+    if (container_len == K8S_CONTAINER_ID_LEN) {
         int is_hex = 1;
         for (i = 0; i < container_len; i++) {
             char c = container_start[i];
@@ -374,7 +322,6 @@ static char* parse_container_from_path(struct flb_ibm_logs *ctx,
             }
         }
         if (is_hex) {
-            /* Looks like a container ID without a name prefix */
             flb_plg_debug(ctx->ins, 
                          "Path appears to contain only container ID without name");
             return NULL;
@@ -394,12 +341,7 @@ static char* parse_container_from_path(struct flb_ibm_logs *ctx,
     return result;
 }
 
-/* Extract application name from various sources following priority order:
- * 1. User configuration (handled by caller)
- * 2. Kubernetes metadata namespace_name
- * 3. Parsed from file path
- * 4. Default value
- */
+/* Extract application name with proper validation */
 static void extract_application_name(struct flb_ibm_logs *ctx,
                                     msgpack_object *kubernetes_map,
                                     const char *file_path,
@@ -411,26 +353,22 @@ static void extract_application_name(struct flb_ibm_logs *ctx,
     msgpack_object v;
     char *parsed_namespace = NULL;
     
-    /* Ensure output pointer is valid */
     if (!app_name) {
         flb_plg_error(ctx->ins, "Invalid app_name pointer");
         return;
     }
     
-    /* Initialize to NULL */
     *app_name = NULL;
     
-    /* Priority 1: Configuration - handled by caller */
-    
-    /* Priority 2: Try Kubernetes metadata namespace_name */
+    /* Try Kubernetes metadata namespace_name */
     if (kubernetes_map && kubernetes_map->type == MSGPACK_OBJECT_MAP) {
         for (j = 0; j < kubernetes_map->via.map.size; j++) {
             k = kubernetes_map->via.map.ptr[j].key;
             v = kubernetes_map->via.map.ptr[j].val;
             
             if (k.type == MSGPACK_OBJECT_STR && 
-                k.via.str.size == 14 &&
-                memcmp(k.via.str.ptr, "namespace_name", 14) == 0) {
+                k.via.str.size == FIELD_NAMESPACE_NAME_LEN &&
+                memcmp(k.via.str.ptr, FIELD_NAMESPACE_NAME, FIELD_NAMESPACE_NAME_LEN) == 0) {
                 
                 if (v.type == MSGPACK_OBJECT_STR && v.via.str.size > 0) {
                     *app_name = flb_sds_create_len(v.via.str.ptr, v.via.str.size);
@@ -443,12 +381,12 @@ static void extract_application_name(struct flb_ibm_logs *ctx,
                     flb_plg_error(ctx->ins, 
                                  "Failed to allocate application name from namespace_name");
                 }
-                break; /* namespace_name found but invalid/allocation failed */
+                break;
             }
         }
     }
     
-    /* Priority 3: Try parsing from file path */
+    /* Try parsing from file path */
     if (file_path && file_path_len > 0) {
         parsed_namespace = parse_namespace_from_path(ctx, file_path, file_path_len);
         if (parsed_namespace) {
@@ -460,73 +398,61 @@ static void extract_application_name(struct flb_ibm_logs *ctx,
         }
     }
     
-    /* Priority 4: Fall back to default */
+    /* Fall back to default */
     *app_name = flb_sds_create(DEFAULT_APP_NAME);
     if (!*app_name) {
         flb_plg_error(ctx->ins, "Critical: Failed to allocate default application name");
-        /* This is a critical error - the caller should check for NULL */
     } else {
         flb_plg_debug(ctx->ins, "Using default application name: %s", *app_name);
     }
 }
 
-/* Extract subsystem name from various sources following priority order:
- * 1. User configuration (handled by caller)
- * 2. Kubernetes annotations container_name
- * 3. Parsed from file path
- * 4. Default value
- */
+/* Extract subsystem name with proper validation */
 static void extract_subsystem_name(struct flb_ibm_logs *ctx,
                                   msgpack_object *kubernetes_map,
                                   const char *file_path,
                                   int file_path_len,
                                   flb_sds_t *subsystem_name)
 {
-    msgpack_object *annotations_map = NULL;
     int j;
     msgpack_object k;
     msgpack_object v;
     char *parsed_container = NULL;
     
-    /* Ensure output pointer is valid */
     if (!subsystem_name) {
         flb_plg_error(ctx->ins, "Invalid subsystem_name pointer");
         return;
     }
     
-    /* Initialize to NULL */
     *subsystem_name = NULL;
     
-    /* Priority 1: Configuration - handled by caller */
-    
-    /* Priority 2: Try Kubernetes metadata container_name */
+    /* Try Kubernetes metadata container_name */
     if (kubernetes_map && kubernetes_map->type == MSGPACK_OBJECT_MAP) {
         for (j = 0; j < kubernetes_map->via.map.size; j++) {
             k = kubernetes_map->via.map.ptr[j].key;
             v = kubernetes_map->via.map.ptr[j].val;
             
             if (k.type == MSGPACK_OBJECT_STR && 
-                k.via.str.size == 14 &&
-                memcmp(k.via.str.ptr, "container_name", 14) == 0) {
+                k.via.str.size == FIELD_CONTAINER_NAME_LEN &&
+                memcmp(k.via.str.ptr, FIELD_CONTAINER_NAME, FIELD_CONTAINER_NAME_LEN) == 0) {
                 
                 if (v.type == MSGPACK_OBJECT_STR && v.via.str.size > 0) {
-                    *subsystem_name = flb_sds_create_len(v.via.str.ptr, 
-                                                            v.via.str.size);
+                    *subsystem_name = flb_sds_create_len(v.via.str.ptr, v.via.str.size);
                     if (*subsystem_name) {
                         flb_plg_debug(ctx->ins, 
-                                        "Subsystem name set from container_name: %s", 
-                                        *subsystem_name);
+                                     "Subsystem name set from container_name: %s", 
+                                     *subsystem_name);
                         return;
                     }
                     flb_plg_error(ctx->ins, 
-                                    "Failed to allocate subsystem name from container_name");
+                                 "Failed to allocate subsystem name from container_name");
                 }
-                break; /* container_name found but invalid/allocation failed */
+                break;
             }
         }
     }
     
-    /* Priority 3: Try parsing from file path */
+    /* Try parsing from file path */
     if (file_path && file_path_len > 0) {
         parsed_container = parse_container_from_path(ctx, file_path, file_path_len);
         if (parsed_container) {
@@ -538,16 +464,16 @@ static void extract_subsystem_name(struct flb_ibm_logs *ctx,
         }
     }
     
-    /* Priority 4: Fall back to default */
+    /* Fall back to default */
     *subsystem_name = flb_sds_create(DEFAULT_SUBSYSTEM_NAME);
     if (!*subsystem_name) {
         flb_plg_error(ctx->ins, "Critical: Failed to allocate default subsystem name");
-        /* This is a critical error - the caller should check for NULL */
     } else {
         flb_plg_debug(ctx->ins, "Using default subsystem name: %s", *subsystem_name);
     }
 }
 
+/* Count logs with threshold checking */
 static int count_logs_with_threshold(size_t last_offset, size_t threshold,
                                     struct flb_log_event_decoder *log_decoder,
                                     struct flb_ibm_logs *ctx)
@@ -557,7 +483,6 @@ static int count_logs_with_threshold(size_t last_offset, size_t threshold,
     size_t off = 0;
     struct flb_log_event log_event;
 
-    /* Adjust decoder offset */
     if (last_offset != 0) {
         log_decoder->offset = last_offset;
     }
@@ -580,6 +505,7 @@ static int count_logs_with_threshold(size_t last_offset, size_t threshold,
     return array_size;
 }
 
+/* Compose payload with enhanced efficiency */
 static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
                                                 const void *data, size_t bytes,
                                                 const char *tag, int tag_len,
@@ -591,6 +517,7 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
     int record_count = 0;
     size_t off = 0;
     size_t last_off = 0;
+    size_t m;
 
     flb_sds_t json;
     msgpack_packer mp_pck;
@@ -606,14 +533,14 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
     /* Count records that fit within threshold */
     record_count = count_logs_with_threshold(last_offset, threshold, log_decoder, ctx);
 
-    /* Reset the decoder to the beginning of the data */
+    /* Reset the decoder */
     flb_log_event_decoder_reset(log_decoder, (char *) data, bytes);
 
     /* Initialize msgpack buffers */
     msgpack_sbuffer_init(&mp_sbuf);
     msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
-    /* Create array of log objects (as required by IBM Cloud Logs API) */
+    /* Create array of log objects */
     msgpack_pack_array(&mp_pck, record_count);
 
     /* Adjust decoder offset */
@@ -643,39 +570,38 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
         should_free_app_name = 0;
         should_free_subsystem_name = 0;
         
-        /* Count additional fields we'll include */
+        /* Count and identify fields in first pass */
         for (i = 0; i < log_event.body->via.map.size; i++) {
             k = log_event.body->via.map.ptr[i].key;
             v = log_event.body->via.map.ptr[i].val;
 
             /* Check for kubernetes metadata */
             if (k.type == MSGPACK_OBJECT_STR &&
-                k.via.str.size == 10 && 
-                memcmp(k.via.str.ptr, "kubernetes", 10) == 0) {
+                k.via.str.size == FIELD_KUBERNETES_LEN && 
+                memcmp(k.via.str.ptr, FIELD_KUBERNETES, FIELD_KUBERNETES_LEN) == 0) {
                 if (v.type == MSGPACK_OBJECT_MAP) {
                     kubernetes_map = &v;
                 }
             }
             /* Check for file field */
             else if (k.type == MSGPACK_OBJECT_STR &&
-                     k.via.str.size == 4 && 
-                     memcmp(k.via.str.ptr, "file", 4) == 0) {
+                     k.via.str.size == FIELD_FILE_LEN && 
+                     memcmp(k.via.str.ptr, FIELD_FILE, FIELD_FILE_LEN) == 0) {
                 if (v.type == MSGPACK_OBJECT_STR) {
                     file_path = v.via.str.ptr;
                     file_path_len = v.via.str.size;
                 }
             }
 
+            /* Check for mapped fields */
             if (k.type == MSGPACK_OBJECT_STR) {
-                /* Check for optional fields we want to map */
-                if ((k.via.str.size == 5 && memcmp(k.via.str.ptr, "level", 5) == 0) ||
-                    (k.via.str.size == 8 && memcmp(k.via.str.ptr, "severity", 8) == 0) ||
-                    (k.via.str.size == 12 && memcmp(k.via.str.ptr, "computerName", 12) == 0) ||
-                    (k.via.str.size == 8 && memcmp(k.via.str.ptr, "category", 8) == 0) ||
-                    (k.via.str.size == 9 && memcmp(k.via.str.ptr, "className", 9) == 0) ||
-                    (k.via.str.size == 10 && memcmp(k.via.str.ptr, "methodName", 10) == 0) ||
-                    (k.via.str.size == 8 && memcmp(k.via.str.ptr, "threadId", 8) == 0)) {
-                    fields_count++;
+                for (m = 0; m < FIELD_MAPPINGS_COUNT; m++) {
+                    if (k.via.str.size == FIELD_MAPPINGS[m].name_len &&
+                        memcmp(k.via.str.ptr, FIELD_MAPPINGS[m].name, 
+                               FIELD_MAPPINGS[m].name_len) == 0) {
+                        fields_count++;
+                        break;
+                    }
                 }
             }
         }
@@ -686,44 +612,37 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
         /* Create log object map */
         msgpack_pack_map(&mp_pck, fields_count);
 
-        /* Required fields */
-        
-        /* applicationName - use configured value or extract from metadata/path */
+        /* Required field: applicationName */
         msgpack_pack_str(&mp_pck, 15);
         msgpack_pack_str_body(&mp_pck, "applicationName", 15);
 
         if (ctx->application_name) {
             app_name_to_use = ctx->application_name;
-            flb_plg_debug(ctx->ins, "application name is provided from the config");
         } else {
             extract_application_name(ctx, kubernetes_map, file_path, file_path_len,
                                     &app_name_to_use);
             should_free_app_name = 1;
             
-            /* Check for allocation failure */
             if (!app_name_to_use) {
                 flb_plg_error(ctx->ins, "Failed to extract application name");
                 goto error;
             }
-            flb_plg_debug(ctx->ins, "application name=%s", app_name_to_use);
         }
         
         msgpack_pack_str(&mp_pck, flb_sds_len(app_name_to_use));
         msgpack_pack_str_body(&mp_pck, app_name_to_use, flb_sds_len(app_name_to_use));
         
-        /* subsystemName - use configured value or extract from metadata/path */
+        /* Required field: subsystemName */
         msgpack_pack_str(&mp_pck, 13);
         msgpack_pack_str_body(&mp_pck, "subsystemName", 13);
 
         if (ctx->subsystem_name) {
             subsystem_name_to_use = ctx->subsystem_name;
-            flb_plg_debug(ctx->ins, "subsystem name is provided from the config");
         } else {
             extract_subsystem_name(ctx, kubernetes_map, file_path, file_path_len,
                                   &subsystem_name_to_use);
             should_free_subsystem_name = 1;
             
-            /* Check for allocation failure */
             if (!subsystem_name_to_use) {
                 flb_plg_error(ctx->ins, "Failed to extract subsystem name");
                 if (should_free_app_name && app_name_to_use) {
@@ -731,46 +650,37 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
                 }
                 goto error;
             }
-            flb_plg_debug(ctx->ins, "subsystem name=%s", subsystem_name_to_use);
         }
         
         msgpack_pack_str(&mp_pck, flb_sds_len(subsystem_name_to_use));
         msgpack_pack_str_body(&mp_pck, subsystem_name_to_use, flb_sds_len(subsystem_name_to_use));
 
-        /* text - the actual log message */
+        /* Required field: text */
         msgpack_pack_str(&mp_pck, 4);
         msgpack_pack_str_body(&mp_pck, "text", 4);
-        /* Pack the entire log record as the text field */
         msgpack_pack_object(&mp_pck, *log_event.body);
 
-        /* timestamp - convert to UTC milliseconds */
+        /* Required field: timestamp */
         msgpack_pack_str(&mp_pck, 9);
         msgpack_pack_str_body(&mp_pck, "timestamp", 9);
         msgpack_pack_uint64(&mp_pck, (uint64_t)(flb_time_to_double(&log_event.timestamp) * 1000));
 
-        /* Optional fields from log record */
+        /* Optional mapped fields */
         for (i = 0; i < log_event.body->via.map.size; i++) {
             k = log_event.body->via.map.ptr[i].key;
             v = log_event.body->via.map.ptr[i].val;
 
             if (k.type == MSGPACK_OBJECT_STR) {
-
-                /* Map level/severity to severity field */
-                if ((k.via.str.size == 5 && memcmp(k.via.str.ptr, "level", 5) == 0) ||
-                    (k.via.str.size == 8 && memcmp(k.via.str.ptr, "severity", 8) == 0)) {
-                    msgpack_pack_str(&mp_pck, 8);
-                    msgpack_pack_str_body(&mp_pck, "severity", 8);
-                    msgpack_pack_object(&mp_pck, v);
-                }
-                
-                /* Map other optional fields directly */
-                else if ((k.via.str.size == 12 && memcmp(k.via.str.ptr, "computerName", 12) == 0) ||
-                         (k.via.str.size == 8 && memcmp(k.via.str.ptr, "category", 8) == 0) ||
-                         (k.via.str.size == 9 && memcmp(k.via.str.ptr, "className", 9) == 0) ||
-                         (k.via.str.size == 10 && memcmp(k.via.str.ptr, "methodName", 10) == 0) ||
-                         (k.via.str.size == 8 && memcmp(k.via.str.ptr, "threadId", 8) == 0)) {
-                    msgpack_pack_object(&mp_pck, k);
-                    msgpack_pack_object(&mp_pck, v);
+                for (m = 0; m < FIELD_MAPPINGS_COUNT; m++) {
+                    if (k.via.str.size == FIELD_MAPPINGS[m].name_len &&
+                        memcmp(k.via.str.ptr, FIELD_MAPPINGS[m].name, 
+                               FIELD_MAPPINGS[m].name_len) == 0) {
+                        msgpack_pack_str(&mp_pck, FIELD_MAPPINGS[m].mapped_name_len);
+                        msgpack_pack_str_body(&mp_pck, FIELD_MAPPINGS[m].mapped_name, 
+                                            FIELD_MAPPINGS[m].mapped_name_len);
+                        msgpack_pack_object(&mp_pck, v);
+                        break;
+                    }
                 }
             }
         }
@@ -820,6 +730,7 @@ error:
     return NULL;
 }
 
+/* Enhanced flush callback */
 static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
                             struct flb_output_flush *out_flush,
                             struct flb_input_instance *i_ins,
@@ -829,36 +740,26 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
     int result;
     int ret_code = FLB_RETRY;
     size_t payload_len;
-    flb_sds_t payload;
+    flb_sds_t payload = NULL;
     size_t b_sent;
     struct flb_ibm_logs *ctx = out_context;
-    struct flb_connection *u_conn;
-    struct flb_http_client *http_client;
+    struct flb_connection *u_conn = NULL;
+    struct flb_http_client *http_client = NULL;
     struct flb_log_event_decoder log_decoder;
 
-    /* IBM Logs has 2MB limit, use 1.6MB threshold for safety */
-    size_t threshold = 1.6 * 1024 * 1024;
+    /* Calculate thresholds in bytes */
+    const size_t two_mebibytes = (size_t)(HTTP_PAYLOAD_MAX_MB * 1024 * 1024);
+    size_t threshold = (size_t)(HTTP_PAYLOAD_THRESHOLD_MB * 1024 * 1024);
     size_t offset = 0;
     size_t out_offset = 0;
     int need_loop = FLB_TRUE;
-    const int retry_limit = 8;
     int retries = 0;
-    const size_t two_mebibytes = 2 * 1024 * 1024;
-
-    size_t temp_used_before, temp_used_after;
-
-    /* Get arena usage before flush */
-    arena_stats(&ctx->temp_arena, &temp_used_before, NULL);
 
     flb_plg_debug(ctx->ins, "flush: processing %zu bytes of data", event_chunk->size);
 
-    /* Reset temporary arena for this flush cycle */
-    arena_reset(&ctx->temp_arena);
-
-    /* Refresh token if needed before sending logs */
+    /* Refresh token if needed */
     result = ibm_auth_refresh_if_needed(ctx, config);
     if (result != 0) {
-        flb_errno();
         flb_plg_error(ctx->ins, "failed to refresh authentication token");
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
@@ -871,10 +772,10 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
     }
 
     /* Prepare log decoder */
-    result = flb_log_event_decoder_init(&log_decoder, (char *) event_chunk->data, event_chunk->size);
+    result = flb_log_event_decoder_init(&log_decoder, (char *) event_chunk->data, 
+                                        event_chunk->size);
     if (result != FLB_EVENT_DECODER_SUCCESS) {
-        flb_plg_error(ctx->ins,
-                      "Log event decoder initialization error : %d", result);
+        flb_plg_error(ctx->ins, "Log event decoder initialization error : %d", result);
         flb_upstream_conn_release(u_conn);
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
@@ -883,7 +784,8 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
     retry:
         if (retries > 0) {
             /* Reduce threshold based on retry count */
-            threshold = (retry_limit - retries)/10.0 * two_mebibytes;
+            threshold = (size_t)((HTTP_RETRY_LIMIT - retries) * 
+                                 HTTP_RETRY_REDUCTION_FACTOR * two_mebibytes);
         }
 
         /* Format the data chunk */
@@ -897,13 +799,9 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
         
         if (!payload) {
             flb_plg_error(ctx->ins, "cannot compose request payload");
-            flb_upstream_conn_release(u_conn);
-            flb_log_event_decoder_destroy(&log_decoder);
-
-            FLB_OUTPUT_RETURN(FLB_ERROR);
+            ret_code = FLB_ERROR;
+            goto cleanup;
         }
-
-        // flb_plg_info(ctx->ins, "payload:\n%s\n\n", payload);
 
         flb_plg_debug(ctx->ins, "the last offset of decoder is %zu", out_offset);
 
@@ -911,43 +809,42 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
 
         if (payload_len >= two_mebibytes) {
             retries++;
-            if (retries >= retry_limit) {
+            if (retries >= HTTP_RETRY_LIMIT) {
                 flb_plg_error(ctx->ins, "Retry limit exceeded for payload composition");
-                flb_upstream_conn_release(u_conn);
+                ret_code = FLB_ERROR;
                 flb_sds_destroy(payload);
-                flb_log_event_decoder_destroy(&log_decoder);
-                FLB_OUTPUT_RETURN(FLB_ERROR);
+                goto cleanup;
             }
 
             flb_plg_debug(ctx->ins,
-                          "HTTP request body exceeded %zd bytes. actual: %zu. left attempt(s): %d",
-                          two_mebibytes, payload_len, retry_limit - retries);
+                          "HTTP request body exceeded %zu bytes. actual: %zu. left attempt(s): %d",
+                          two_mebibytes, payload_len, HTTP_RETRY_LIMIT - retries);
             flb_sds_destroy(payload);
+            payload = NULL;
             goto retry;
         }
         else {
             retries = 0;
         }
 
-        flb_plg_debug(ctx->ins, "sending payload: %zu bytes to %s", payload_len, ctx->ibm_logs_path);
+        flb_plg_debug(ctx->ins, "sending payload: %zu bytes to %s", 
+                     payload_len, ctx->ibm_logs_path);
 
         /* Create HTTP client */
         http_client = flb_http_client(u_conn, FLB_HTTP_POST, ctx->ibm_logs_path,
-                            payload, payload_len,
-                            ctx->ibm_logs_host, ctx->ibm_logs_port, NULL, 0);
+                                      payload, payload_len,
+                                      ctx->ibm_logs_host, ctx->ibm_logs_port, 
+                                      NULL, 0);
 
         if (!http_client) {
             flb_plg_error(ctx->ins, "cannot create http client");
+            ret_code = FLB_ERROR;
             flb_sds_destroy(payload);
-            flb_upstream_conn_release(u_conn);
-            flb_log_event_decoder_destroy(&log_decoder);
-            FLB_OUTPUT_RETURN(FLB_ERROR);
+            goto cleanup;
         }
 
-        /* Compose and append Authorization header */
+        /* Add headers */
         flb_http_bearer_auth(http_client, ctx->auth->bearer_token);
-
-        /* Add Content-Type header */
         flb_http_add_header(http_client, "Content-Type", 12, "application/json", 16);
 
         /* Perform HTTP request */
@@ -962,7 +859,7 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
             /* Validate HTTP status */
             if (http_client->resp.status == 0) {
                 flb_plg_error(ctx->ins, "connection broken or no response received");
-                 ret_code = FLB_RETRY;
+                ret_code = FLB_RETRY;
             }
             else if (http_client->resp.status < 200 || http_client->resp.status >= 300) {
                 if (http_client->resp.status == 401) {
@@ -973,13 +870,16 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
                     flb_plg_warn(ctx->ins, "rate limited (429), will retry");
                     ret_code = FLB_RETRY;
                 } else if (http_client->resp.status >= 500) {
-                    flb_plg_warn(ctx->ins, "server error (status=%d), will retry", http_client->resp.status);
+                    flb_plg_warn(ctx->ins, "server error (status=%d), will retry", 
+                                http_client->resp.status);
                     ret_code = FLB_RETRY;
                 } else {
-                    flb_plg_error(ctx->ins, "unexpected HTTP status=%d", http_client->resp.status);
+                    flb_plg_error(ctx->ins, "unexpected HTTP status=%d", 
+                                 http_client->resp.status);
                     if (http_client->resp.payload_size > 0) {
                         flb_plg_error(ctx->ins, "server response: %.*s",
-                                      (int)http_client->resp.payload_size, http_client->resp.payload);
+                                      (int)http_client->resp.payload_size, 
+                                      http_client->resp.payload);
                     }
                     ret_code = FLB_ERROR;
                 }
@@ -988,15 +888,19 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
                 /* Success */
                 ret_code = FLB_OK;
                 
-                /* Update statistics for this chunk */
-                int chunk_count = count_logs_with_threshold(offset, threshold, &log_decoder, ctx);
+                /* Update statistics */
+                int chunk_count = count_logs_with_threshold(offset, threshold, 
+                                                            &log_decoder, ctx);
                 ctx->total_logs_sent += chunk_count;
+                ctx->total_bytes_sent += payload_len;
             }
         }
 
         /* Clean up HTTP client for this iteration */
         flb_sds_destroy(payload);
+        payload = NULL;
         flb_http_client_destroy(http_client);
+        http_client = NULL;
 
         /* If we got an error, bail out */
         if (ret_code != FLB_OK) {
@@ -1015,22 +919,26 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
     /* Update flush count */
     ctx->flush_count++;
 
-    /* Get arena usage after flush */
-    arena_stats(&ctx->temp_arena, &temp_used_after, NULL);
-    flb_plg_debug(ctx->ins, "temp arena usage: %zu bytes (was %zu bytes)",
-                  temp_used_after, temp_used_before);
-
-    /* Cleanup */
+cleanup:
+    /* Cleanup resources */
+    if (payload) {
+        flb_sds_destroy(payload);
+    }
+    if (http_client) {
+        flb_http_client_destroy(http_client);
+    }
     flb_log_event_decoder_destroy(&log_decoder);
-    flb_upstream_conn_release(u_conn);
+    if (u_conn) {
+        flb_upstream_conn_release(u_conn);
+    }
 
     FLB_OUTPUT_RETURN(ret_code);
 }
 
+/* Enhanced exit callback */
 static int cb_ibm_logs_exit(void *data, struct flb_config *config)
 {
     struct flb_ibm_logs *ctx = data;
-    size_t global_used, temp_used;
 
     if (!ctx) {
         return 0;
@@ -1038,20 +946,11 @@ static int cb_ibm_logs_exit(void *data, struct flb_config *config)
 
     flb_plg_info(ctx->ins, "exiting IBM Cloud Logs output plugin");
 
-    /* Log final statistics */
-    arena_stats(&ctx->global_arena, &global_used, NULL);
-    arena_stats(&ctx->temp_arena, &temp_used, NULL);
-
     flb_plg_info(ctx->ins, "statistics:");
-    // TODO
     flb_plg_info(ctx->ins, "  Total logs sent: %llu", ctx->total_logs_sent);
+    flb_plg_info(ctx->ins, "  Total bytes sent: %llu", ctx->total_bytes_sent);
     flb_plg_info(ctx->ins, "  Total flushes: %llu", ctx->flush_count);
-    flb_plg_info(ctx->ins, "  global arena final usage: %zu bytes", global_used);
-    flb_plg_info(ctx->ins, "  temp arena peak usage: %zu bytes", temp_used);
-
-    /* Destroy arenas */
-    arena_destroy(&ctx->temp_arena);
-    arena_destroy(&ctx->global_arena);
+    flb_plg_info(ctx->ins, "  Auth refreshes: %llu", ctx->auth_refresh_count);
 
     /* Clear sensitive auth data */
     ibm_auth_cleanup(ctx);
@@ -1121,6 +1020,8 @@ static struct flb_config_map config_map[] = {
      "Set CR token mount path"
     },
 
+    /* Add terminator */
+    {0}
 };
 
 /* Plugin registration */
