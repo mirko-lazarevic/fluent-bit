@@ -24,8 +24,10 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_input.h>
 
 #include "flb_tests_runtime.h"
+#include "../../plugins/in_opentelemetry/opentelemetry_prot.h"
 #define JSON_CONTENT_TYPE "application/json"
 
 #define PORT_OTEL 4318
@@ -46,6 +48,21 @@ struct test_ctx {
     int o_ffd;         /* Output fd */
     struct http_client_ctx *httpc;
 };
+
+static struct flb_input_instance *get_opentelemetry_instance(flb_ctx_t *flb_ctx)
+{
+    struct mk_list *head;
+    struct flb_input_instance *ins;
+
+    mk_list_foreach(head, &flb_ctx->config->inputs) {
+        ins = mk_list_entry(head, struct flb_input_instance, _head);
+        if (ins->p && strcmp(ins->p->name, "opentelemetry") == 0) {
+            return ins;
+        }
+    }
+
+    return NULL;
+}
 
 
 pthread_mutex_t result_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -98,7 +115,7 @@ static char *get_group_metadata(void *chunk, size_t size)
         return NULL;
     }
 
-    json = flb_msgpack_to_json_str(1024, log_event.metadata);
+    json = flb_msgpack_to_json_str(1024, log_event.metadata, FLB_TRUE);
     flb_log_event_decoder_destroy(&log_decoder);
     return json;
 }
@@ -121,7 +138,7 @@ static char *get_group_body(void *chunk, size_t size)
         return NULL;
     }
 
-    json = flb_msgpack_to_json_str(1024, log_event.body);
+    json = flb_msgpack_to_json_str(1024, log_event.body, FLB_TRUE);
     flb_log_event_decoder_destroy(&log_decoder);
     return json;
 }
@@ -146,7 +163,7 @@ static char *get_log_body(void *chunk, size_t size)
     flb_log_event_decoder_next(&log_decoder, &log_event);
 
     /* convert log body to json */
-    json = flb_msgpack_to_json_str(1024, log_event.body);
+    json = flb_msgpack_to_json_str(1024, log_event.body, FLB_TRUE);
 
     flb_log_event_decoder_destroy(&log_decoder);
     return json;
@@ -733,6 +750,78 @@ void flb_test_tag_from_uri_false()
     test_ctx_destroy(ctx);
 }
 
+void flb_test_tag_explicit_overrides_uri_for_all_signals()
+{
+    struct flb_opentelemetry *otel_ctx;
+    struct flb_input_instance *ins;
+    struct test_ctx *ctx;
+    struct flb_lib_out_cb cb_data;
+    flb_sds_t tag;
+    int ret;
+
+    cb_data.cb = cb_no_check;
+    cb_data.data = NULL;
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "tag", "trace_otel",
+                        "tag_from_uri", "true",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ins = get_opentelemetry_instance(ctx->flb);
+    TEST_CHECK(ins != NULL);
+    TEST_CHECK(ins->tag_default == FLB_FALSE);
+
+    otel_ctx = (struct flb_opentelemetry *) ins->context;
+    TEST_CHECK(otel_ctx != NULL);
+    TEST_CHECK(otel_ctx->tag_from_uri == FLB_TRUE);
+
+    tag = opentelemetry_prot_create_request_tag(otel_ctx, "v1_logs");
+    TEST_CHECK(tag != NULL);
+    TEST_CHECK(strcmp(tag, "trace_otel") == 0);
+    if (tag != NULL) {
+        flb_sds_destroy(tag);
+    }
+
+    tag = opentelemetry_prot_create_request_tag(otel_ctx, "v1_metrics");
+    TEST_CHECK(tag != NULL);
+    TEST_CHECK(strcmp(tag, "trace_otel") == 0);
+    if (tag != NULL) {
+        flb_sds_destroy(tag);
+    }
+
+    tag = opentelemetry_prot_create_request_tag(otel_ctx, "v1_traces");
+    TEST_CHECK(tag != NULL);
+    TEST_CHECK(strcmp(tag, "trace_otel") == 0);
+    if (tag != NULL) {
+        flb_sds_destroy(tag);
+    }
+
+    tag = opentelemetry_prot_create_request_tag(otel_ctx, "v1development_profiles");
+    TEST_CHECK(tag != NULL);
+    TEST_CHECK(strcmp(tag, "trace_otel") == 0);
+    if (tag != NULL) {
+        flb_sds_destroy(tag);
+    }
+
+    test_ctx_destroy(ctx);
+}
+
 TEST_LIST = {
     {"log_group_metadata"          , flb_test_log_group_metadata},
     {"log_group_body"              , flb_test_log_group_body},
@@ -741,5 +830,6 @@ TEST_LIST = {
     {"successful_response_code_200", flb_test_successful_response_code_200},
     {"successful_response_code_204", flb_test_successful_response_code_204},
     {"tag_from_uri_false"          , flb_test_tag_from_uri_false},
+    {"tag_explicit_overrides_uri_for_all_signals", flb_test_tag_explicit_overrides_uri_for_all_signals},
     {NULL, NULL}
 };

@@ -19,16 +19,213 @@
  */
 
 #include <stdlib.h>
+#include <fcntl.h>
+#include <string.h>
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#endif
+
 #include <fluent-bit.h>
 #include <fluent-bit/flb_compat.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_http_client.h>
+#include <fluent-bit/flb_network.h>
 #include <monkey/mk_core.h>
 #include "flb_tests_runtime.h"
 
 #define JSON_CONTENT_TYPE "application/json"
 #define JSON_CHARSET_CONTENT_TYPE "application/json; charset=utf-8"
+#define MOCK_JWKS_BODY "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"test\",\"n\":\"xCUx72fXOyrjUZiiPJZIa7HtYHdQo_LAAkYG3yAcl1mwmh8pXrXB71xSDBI5SZDtKW4g6FEzYmP0jv3xwBdrZO2HQYwdxpCLhiMKEF0neC5w4NsjFlZKpnO53GN5W_c95bEhlVbh7O2q3PZVDhF5x9bdjlDS84NA0CY2l10UbSvIz12XR8uXqt6w9WVznrCe7ucSex3YPBTwll8Tm5H1rs1tPSx_9D0CJtZvxhKfgJtDyJJmV9syI6hlRgXnAsOonycOGSLryaIBtttxKUwy6QQkA-qSLZe2EcG2XoeBy10geOZ4WKGRiGubuuDpB1yFFy4mXQULJF6anO2osE31SQ\",\"e\":\"AQAB\"}]}"
+#define MOCK_VALID_JWT "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QiLCJ0eXAiOiJKV1QifQ.eyJleHAiOjE4OTM0NTYwMDAsImlzcyI6Imlzc3VlciIsImF1ZCI6ImF1ZGllbmNlIiwiYXpwIjoiY2xpZW50MSJ9.TqWs06LUpQa0FGLejnOkWAD6v562d5CUh2NwsJ7iAuae9-WNFBKU6mP1zAaoafla6o5npee7RfbSzZNFI4PKhqAj69789JjAYV7IW-GSuMwJejHdVOWmCc5lmcZPH0EVxEkHA6lFQxYQwDCrfQ8Sd4Q3vYCV6sLPENcuNpQi9ytjVjaZs_7ONH2oA-sZ7EUchqJJoIBPfjit2yYsq9NeemxCzYMtngiC-IX12eEfaQ1cVYPIjhhN_NaMvapznp-BW4gnXkNoAZ1S-p1axWWY-6UgRdMYOr0Hy5PHQ9fCuHJ6Z-blYdtuGavCUGHK5ghX-JdH1WJ51F89992dQ5yF_w"
+
+struct jwks_mock_server {
+    flb_sockfd_t listen_fd;
+    int port;
+    int stop;
+    pthread_t thread;
+};
+
+static void jwks_mock_send_response(flb_sockfd_t fd)
+{
+    char buffer[2048];
+    int len;
+    int sent;
+    int total;
+
+    len = snprintf(buffer, sizeof(buffer),
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Length: %zu\r\n"
+             "Content-Type: application/json\r\n"
+             "Connection: close\r\n\r\n"
+             "%s",
+             strlen(MOCK_JWKS_BODY), MOCK_JWKS_BODY);
+
+    printf("jwks_mock_send_response: Sending %d bytes (Content-Length: %zu)\n", len, strlen(MOCK_JWKS_BODY));
+    fflush(stdout);
+
+    total = 0;
+    while (total < len) {
+        sent = send(fd, buffer + total, len - total, 0);
+        if (sent <= 0) {
+            break;
+        }
+        total += sent;
+    }
+}
+
+static void *jwks_mock_server_thread(void *data)
+{
+    struct jwks_mock_server *server = (struct jwks_mock_server *) data;
+    fd_set rfds;
+    struct timeval tv;
+    flb_sockfd_t client_fd;
+    char request[2048];
+    int total;
+    int bytes;
+
+    client_fd = FLB_INVALID_SOCKET;
+    while (!server->stop) {
+        FD_ZERO(&rfds);
+        FD_SET(server->listen_fd, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000;
+
+        if (select((int) (server->listen_fd + 1), &rfds, NULL, NULL, &tv) <= 0) {
+            continue;
+        }
+
+        client_fd = accept(server->listen_fd, NULL, NULL);
+        if (client_fd == FLB_INVALID_SOCKET) {
+            continue;
+        }
+
+        flb_net_socket_blocking(client_fd);
+
+        memset(request, 0, sizeof(request));
+        total = 0;
+        while (total < sizeof(request) - 1) {
+            bytes = recv(client_fd, request + total,
+                         (int) (sizeof(request) - 1 - total), 0);
+            if (bytes <= 0) {
+                break;
+            }
+
+            total += bytes;
+            request[total] = '\0';
+            if (strstr(request, "\r\n\r\n") != NULL) {
+                break;
+            }
+        }
+
+        jwks_mock_send_response(client_fd);
+        flb_socket_close(client_fd);
+    }
+
+    return NULL;
+}
+
+static int jwks_mock_server_start(struct jwks_mock_server *server)
+{
+    int on = 1;
+    struct sockaddr_in addr;
+    socklen_t len;
+    int flags;
+
+    memset(server, 0, sizeof(struct jwks_mock_server));
+    server->listen_fd = FLB_INVALID_SOCKET;
+
+#ifdef _WIN32
+    {
+        WSADATA wsa_data;
+        WSAStartup(0x0201, &wsa_data);
+    }
+#endif
+    server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->listen_fd == FLB_INVALID_SOCKET) {
+#ifdef _WIN32
+        fprintf(stderr, "socket failed with WSAGetLastError: %d\n", WSAGetLastError());
+#else
+        perror("socket");
+#endif
+        return -1;
+    }
+
+    setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+
+    if (bind(server->listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+#ifdef _WIN32
+        fprintf(stderr, "bind failed with WSAGetLastError: %d\n", WSAGetLastError());
+#else
+        perror("bind");
+#endif
+        flb_socket_close(server->listen_fd);
+        return -1;
+    }
+
+    len = sizeof(addr);
+    if (getsockname(server->listen_fd, (struct sockaddr *) &addr, &len) < 0) {
+#ifdef _WIN32
+        fprintf(stderr, "getsockname failed with WSAGetLastError: %d\n", WSAGetLastError());
+#else
+        perror("getsockname");
+#endif
+        flb_socket_close(server->listen_fd);
+        return -1;
+    }
+
+    server->port = ntohs(addr.sin_port);
+
+    if (listen(server->listen_fd, 4) < 0) {
+#ifdef _WIN32
+        fprintf(stderr, "listen failed with WSAGetLastError: %d\n", WSAGetLastError());
+#else
+        perror("listen");
+#endif
+        flb_socket_close(server->listen_fd);
+        return -1;
+    }
+
+#ifndef _WIN32
+    flags = fcntl(server->listen_fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(server->listen_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+#else
+    {
+        u_long mode = 1;
+        ioctlsocket(server->listen_fd, FIONBIO, &mode);
+    }
+#endif
+
+    if (pthread_create(&server->thread, NULL, jwks_mock_server_thread, server) != 0) {
+        perror("pthread_create");
+        flb_socket_close(server->listen_fd);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void jwks_mock_server_stop(struct jwks_mock_server *server)
+{
+    if (server->listen_fd == FLB_INVALID_SOCKET) {
+        return;
+    }
+
+    server->stop = 1;
+    pthread_join(server->thread, NULL);
+    flb_socket_close(server->listen_fd);
+    server->listen_fd = FLB_INVALID_SOCKET;
+}
 
 struct http_client_ctx {
     struct flb_upstream      *u;
@@ -103,6 +300,11 @@ struct http_client_ctx* http_client_ctx_create()
 {
     struct http_client_ctx *ret_ctx = NULL;
     struct mk_event_loop *evl = NULL;
+
+#ifdef _WIN32
+    WSADATA wsa_data;
+    WSAStartup(0x0201, &wsa_data);
+#endif
 
     ret_ctx = flb_calloc(1, sizeof(struct http_client_ctx));
     if (!TEST_CHECK(ret_ctx != NULL)) {
@@ -205,13 +407,165 @@ static void test_ctx_destroy(struct test_ctx *ctx)
         http_client_ctx_destroy(ctx->httpc);
     }
 
-    sleep(1);
+    flb_time_msleep(1000);
     flb_stop(ctx->flb);
     flb_destroy(ctx->flb);
     flb_free(ctx);
 }
 
-void flb_test_http()
+static int send_raw_http_request(const char *request,
+                                 char *response,
+                                 size_t response_size)
+{
+    struct sockaddr_in address;
+    struct timeval timeout;
+    fd_set read_fds;
+    flb_sockfd_t fd;
+    size_t request_length;
+    size_t request_offset;
+    int ret;
+    int written;
+    int received;
+    int response_length;
+
+    if (response_size < 2) {
+        return -1;
+    }
+
+    response[0] = '\0';
+    request_length = strlen(request);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == FLB_INVALID_SOCKET) {
+        return -1;
+    }
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(9880);
+
+    ret = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (ret != 0) {
+        flb_socket_close(fd);
+        return -1;
+    }
+
+    request_offset = 0;
+    while (request_offset < request_length) {
+        written = send(fd,
+                       request + request_offset,
+                       (int) (request_length - request_offset),
+                       0);
+        if (written <= 0) {
+            flb_socket_close(fd);
+            return -1;
+        }
+        request_offset += (size_t) written;
+    }
+
+    response_length = 0;
+    while (response_length < (int) response_size - 1) {
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 0;
+
+        ret = select((int) (fd + 1), &read_fds, NULL, NULL, &timeout);
+        if (ret <= 0) {
+            flb_socket_close(fd);
+            return -1;
+        }
+
+        received = recv(fd,
+                        response + response_length,
+                        (int) response_size - 1 - response_length,
+                        0);
+        if (received <= 0) {
+            break;
+        }
+
+        response_length += received;
+        response[response_length] = '\0';
+        if (strstr(response, "\r\n") != NULL) {
+            break;
+        }
+    }
+
+    flb_socket_close(fd);
+    response[response_length] = '\0';
+
+    if (response_length > 0 && strstr(response, "\r\n") == NULL) {
+        return -1;
+    }
+
+    return response_length;
+}
+
+static int send_empty_header_request(void)
+{
+    const char *body = "{\"test\":\"msg\"}";
+    const char *request_template =
+        "POST / HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Length: %zu\r\n"
+        "Content-Type: application/json\r\n"
+        "X-Empty:\r\n"
+        "X-Empty-Whitespace: \t\r\n"
+        "\r\n"
+        "%s";
+    char request[512];
+    char response[256];
+    int ret;
+    int response_length;
+
+    ret = snprintf(request, sizeof(request), request_template,
+                   strlen(body), body);
+    if (ret <= 0 || (size_t) ret >= sizeof(request)) {
+        return -1;
+    }
+
+    response_length = send_raw_http_request(request, response, sizeof(response));
+    if (response_length <= 0) {
+        return -1;
+    }
+
+    return strstr(response, "HTTP/1.1 201") != NULL ? 0 : -1;
+}
+
+static int send_invalid_header_request(void)
+{
+    const char *body = "{\"test\":\"msg\"}";
+    const char *request_template =
+        "POST / HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Length: %zu\r\n"
+        "Content-Type: application/json\r\n"
+        "Upgrade:\r\n"
+        "\r\n"
+        "%s";
+    char request[512];
+    char response[256];
+    int ret;
+    int response_length;
+
+    ret = snprintf(request, sizeof(request), request_template,
+                   strlen(body), body);
+    if (ret <= 0 || (size_t) ret >= sizeof(request)) {
+        return -1;
+    }
+
+    response_length = send_raw_http_request(request, response, sizeof(response));
+    if (response_length < 0) {
+        return -1;
+    }
+    if (response_length == 0) {
+        return 0;
+    }
+
+    return strstr(response, "HTTP/1.1 4") != NULL ? 0 : -1;
+}
+
+void flb_test_http(void)
 {
     struct flb_lib_out_cb cb_data;
     struct test_ctx *ctx;
@@ -267,13 +621,26 @@ void flb_test_http()
         TEST_MSG("http response code error. expect: 201, got: %d\n", c->resp.status);
     }
 
+    /* Ensure the first request has reached the callback before the regression. */
+    flb_time_msleep(1500);
+    num = get_output_num();
+    TEST_CHECK(num > 0);
+
+    TEST_CHECK(send_empty_header_request() == 0);
+
     /* waiting to flush */
     flb_time_msleep(1500);
 
-    num = get_output_num();
-    if (!TEST_CHECK(num > 0))  {
-        TEST_MSG("no outputs");
+    if (!TEST_CHECK(get_output_num() > num)) {
+        TEST_MSG("empty-header request did not reach the callback");
     }
+
+    num = get_output_num();
+    TEST_CHECK(send_invalid_header_request() == 0);
+    /* Observe the same full dispatch and flush window as accepted requests. */
+    flb_time_msleep(1500);
+    TEST_CHECK(get_output_num() == num);
+
     flb_http_client_destroy(c);
     flb_upstream_conn_release(ctx->httpc->u_conn);
     test_ctx_destroy(ctx);
@@ -427,19 +794,19 @@ void flb_test_http_json_charset_header(char *response_code)
     test_ctx_destroy(ctx);
 }
 
-void flb_test_http_successful_response_code_200()
+void flb_test_http_successful_response_code_200(void)
 {
     flb_test_http_successful_response_code("200");
     flb_test_http_json_charset_header("200");
 }
 
-void flb_test_http_successful_response_code_204()
+void flb_test_http_successful_response_code_204(void)
 {
     flb_test_http_successful_response_code("204");
     flb_test_http_json_charset_header("204");
 }
 
-void flb_test_http_failure_400_bad_json() {
+void flb_test_http_failure_400_bad_json(void) {
     struct flb_lib_out_cb cb_data;
     struct test_ctx *ctx;
     struct flb_http_client *c;
@@ -504,7 +871,7 @@ void flb_test_http_failure_400_bad_json() {
     test_ctx_destroy(ctx);
 }
 
-void flb_test_http_failure_400_bad_disk_write()
+void flb_test_http_failure_400_bad_disk_write(void)
 {
     struct flb_lib_out_cb cb_data;
     struct test_ctx *ctx;
@@ -661,14 +1028,277 @@ void test_http_tag_key(char *input)
     test_ctx_destroy(ctx);
 }
 
-void flb_test_http_tag_key_with_map_input()
+void flb_test_http_tag_key_with_map_input(void)
 {
     test_http_tag_key("{\"tag\":\"new_tag\",\"test\":\"msg\"}");
 }
 
-void flb_test_http_tag_key_with_array_input()
+void flb_test_http_tag_key_with_array_input(void)
 {
     test_http_tag_key("[{\"tag\":\"new_tag\",\"test\":\"msg\"}]");
+}
+
+void flb_test_http_oauth2_requires_token(void)
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    struct flb_http_client *c;
+    struct jwks_mock_server jwks;
+    char jwks_url[64];
+    int ret;
+    size_t b_sent;
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    if (!TEST_CHECK(jwks_mock_server_start(&jwks) == 0)) {
+        TEST_MSG("unable to start mock jwks server");
+        return;
+    }
+
+    snprintf(jwks_url, sizeof(jwks_url), "http://127.0.0.1:%d/jwks", jwks.port);
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        jwks_mock_server_stop(&jwks);
+        return;
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "oauth2.validate", "true",
+                        "oauth2.issuer", "issuer",
+                        "oauth2.jwks_url", jwks_url,
+                        "oauth2.allowed_audience", "audience",
+                        "oauth2.allowed_clients", "client1",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ctx->httpc = http_client_ctx_create();
+    TEST_CHECK(ctx->httpc != NULL);
+
+    c = flb_http_client(ctx->httpc->u_conn, FLB_HTTP_POST, "/", "{\"test\":\"msg\"}", 15,
+                        "127.0.0.1", 9880, NULL, 0);
+    TEST_CHECK(c != NULL);
+
+    ret = flb_http_add_header(c, FLB_HTTP_HEADER_CONTENT_TYPE, strlen(FLB_HTTP_HEADER_CONTENT_TYPE),
+                              JSON_CONTENT_TYPE, strlen(JSON_CONTENT_TYPE));
+    TEST_CHECK(ret == 0);
+
+    ret = flb_http_do(c, &b_sent);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(c->resp.status == 401);
+
+    flb_time_msleep(500);
+    TEST_CHECK(get_output_num() == 0);
+
+    flb_http_client_destroy(c);
+    flb_upstream_conn_release(ctx->httpc->u_conn);
+    test_ctx_destroy(ctx);
+    jwks_mock_server_stop(&jwks);
+}
+
+void flb_test_http_oauth2_accepts_valid_token(void)
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    struct flb_http_client *c;
+    struct jwks_mock_server jwks;
+    char jwks_url[64];
+    int ret;
+    size_t b_sent;
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    if (!TEST_CHECK(jwks_mock_server_start(&jwks) == 0)) {
+        TEST_MSG("unable to start mock jwks server");
+        return;
+    }
+
+    snprintf(jwks_url, sizeof(jwks_url), "http://127.0.0.1:%d/jwks", jwks.port);
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        jwks_mock_server_stop(&jwks);
+        return;
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "oauth2.validate", "true",
+                        "oauth2.issuer", "issuer",
+                        "oauth2.jwks_url", jwks_url,
+                        "oauth2.allowed_audience", "audience",
+                        "oauth2.allowed_clients", "client1",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ctx->httpc = http_client_ctx_create();
+    TEST_CHECK(ctx->httpc != NULL);
+
+    c = flb_http_client(ctx->httpc->u_conn, FLB_HTTP_POST, "/", "{\"test\":\"msg\"}", 15,
+                        "127.0.0.1", 9880, NULL, 0);
+    TEST_CHECK(c != NULL);
+
+    ret = flb_http_add_header(c, FLB_HTTP_HEADER_CONTENT_TYPE, strlen(FLB_HTTP_HEADER_CONTENT_TYPE),
+                              JSON_CONTENT_TYPE, strlen(JSON_CONTENT_TYPE));
+    TEST_CHECK(ret == 0);
+
+    ret = flb_http_add_header(c, FLB_HTTP_HEADER_AUTH, strlen(FLB_HTTP_HEADER_AUTH),
+                              "Bearer " MOCK_VALID_JWT,
+                              strlen("Bearer " MOCK_VALID_JWT));
+    TEST_CHECK(ret == 0);
+
+    ret = flb_http_do(c, &b_sent);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(c->resp.status == 201);
+
+    flb_time_msleep(1500);
+    TEST_CHECK(get_output_num() > 0);
+
+    flb_http_client_destroy(c);
+    flb_upstream_conn_release(ctx->httpc->u_conn);
+    test_ctx_destroy(ctx);
+    jwks_mock_server_stop(&jwks);
+}
+
+void test_http_add_remote_addr(char *input, char *xff_content, char *expected_ip, char *http2_cfg)
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    struct flb_http_client *c;
+    int ret;
+    int num;
+    size_t b_sent;
+    char expected_buffer[64];
+
+    char *buf = input;
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    ret = snprintf(expected_buffer, sizeof(expected_buffer),"\"test\":\"msg\",\"REMOTE_ADDR\":\"%s\"", expected_ip);
+
+    if(!TEST_CHECK(ret > 0)) {
+        TEST_MSG("snprintf failed");
+        exit(EXIT_FAILURE);
+    }
+    cb_data.data = expected_buffer;
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "add_remote_addr", "true",
+                        "http2", http2_cfg,
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ctx->httpc = http_client_ctx_create();
+    TEST_CHECK(ctx->httpc != NULL);
+
+    c = flb_http_client(ctx->httpc->u_conn, FLB_HTTP_POST, "/", buf, strlen(buf),
+                        "127.0.0.1", 9880, NULL, 0);
+    ret = flb_http_add_header(c, FLB_HTTP_HEADER_CONTENT_TYPE, strlen(FLB_HTTP_HEADER_CONTENT_TYPE),
+                              JSON_CONTENT_TYPE, strlen(JSON_CONTENT_TYPE));
+    TEST_CHECK(ret == 0);
+    if (!TEST_CHECK(c != NULL)) {
+        TEST_MSG("http_client failed");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Add XFF header (undefined in the flb_http_client) */
+    ret = flb_http_add_header(c, "X-Forwarded-For", strlen("X-Forwarded-For"),
+                              xff_content, strlen(xff_content));
+    TEST_CHECK(ret == 0);
+    if (!TEST_CHECK(c != NULL)) {
+        TEST_MSG("http_client failed (XFF header)");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_http_do(c, &b_sent);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("ret error. ret=%d\n", ret);
+    }
+    else if (!TEST_CHECK(b_sent > 0)){
+        TEST_MSG("b_sent size error. b_sent = %lu\n", b_sent);
+    }
+    else if (!TEST_CHECK(c->resp.status == 201)) {
+        TEST_MSG("http response code error. expect: 201, got: %d\n", c->resp.status);
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(1500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num > 0))  {
+        TEST_MSG("no outputs");
+    }
+    flb_http_client_destroy(c);
+    flb_upstream_conn_release(ctx->httpc->u_conn);
+    test_ctx_destroy(ctx);
+}
+
+/* Test if remote_addr injection is skipped if remote_addr_key is already present */
+void flb_test_http_remote_addr_skip_colliding_ng(void)
+{
+    test_http_add_remote_addr("{\"test\":\"msg\",\"REMOTE_ADDR\":\"old\"}", "1.2.3.4, 5.6.7.8", "old", "true");
+}
+
+/* Test flow through next gen http server */
+void flb_test_http_remote_addr_map_ng(void)
+{
+    test_http_add_remote_addr("{\"test\":\"msg\"}", "1.2.3.4, 5.6.7.8", "1.2.3.4", "true");
+}
+
+void flb_test_http_remote_addr_array_ng(void)
+{
+    test_http_add_remote_addr("[{\"test\":\"msg\"}]", "1.2.3.4, 5.6.7.8", "1.2.3.4", "true");
+}
+
+/* Test flow through legacy http server (monkey) */
+void flb_test_http_remote_addr_map(void)
+{
+    test_http_add_remote_addr("{\"test\":\"msg\"}", "1.2.3.4, 5.6.7.8", "1.2.3.4", "false");
+}
+
+void flb_test_http_remote_addr_array(void)
+{
+    test_http_add_remote_addr("[{\"test\":\"msg\"}]", "1.2.3.4, 5.6.7.8", "1.2.3.4", "false");
 }
 
 TEST_LIST = {
@@ -679,5 +1309,12 @@ TEST_LIST = {
     {"failure_response_code_400_bad_disk_write", flb_test_http_failure_400_bad_disk_write},
     {"tag_key_with_map_input", flb_test_http_tag_key_with_map_input},
     {"tag_key_with_array_input", flb_test_http_tag_key_with_array_input},
+    {"oauth2_requires_token", flb_test_http_oauth2_requires_token},
+    {"oauth2_accepts_valid_token", flb_test_http_oauth2_accepts_valid_token},
+    {"add_remote_addr_skip_colliding_ng", flb_test_http_remote_addr_skip_colliding_ng},
+    {"add_remote_addr_map_ng", flb_test_http_remote_addr_map_ng},
+    {"add_remote_addr_array_ng", flb_test_http_remote_addr_array_ng},
+    {"add_remote_addr_map", flb_test_http_remote_addr_map},
+    {"add_remote_addr_array", flb_test_http_remote_addr_array},
     {NULL, NULL}
 };

@@ -14,18 +14,27 @@ on:
         default: ""
 
 name: Build packages for master
+
+permissions:
+  contents: read
+
 jobs:
   master-build-generate-matrix:
     name: Staging build matrix
     runs-on: ubuntu-latest
     outputs:
       build-matrix: ${{ steps.set-matrix.outputs.matrix }}
+    permissions:
+      contents: read
     steps:
       # Set up the list of target to build so we can pass the JSON to the reusable job
       - id: set-matrix
         run: |
           matrix=$((
-            echo '{ "distro" : [ "debian/bullseye", "ubuntu/20.04", "ubuntu/22.04", "centos/7" ]}'
+            echo '{ "distro" : ['
+            echo '"debian/bullseye", "debian/trixie",'
+            echo '"ubuntu/20.04", "ubuntu/22.04", "centos/7"'
+            echo ']}'
           ) | jq -c .)
           if [ -n "${{ github.event.inputs.target || '' }}" ]; then
             echo "Overriding matrix to build: ${{ github.event.inputs.target }}"
@@ -42,6 +51,8 @@ jobs:
 
   master-build-packages:
     needs: master-build-generate-matrix
+    permissions:
+      contents: read
     uses: ./.github/workflows/call-build-linux-packages.yaml
     with:
       version: master

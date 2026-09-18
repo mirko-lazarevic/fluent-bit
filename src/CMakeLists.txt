@@ -16,7 +16,9 @@ set(src
   flb_hash_table.c
   flb_help.c
   flb_pack.c
+  flb_pack_json.c
   flb_pack_gelf.c
+  flb_json.c
   flb_sds.c
   flb_sds_list.c
   flb_pipe.c
@@ -25,6 +27,7 @@ set(src
   flb_custom.c
   flb_input.c
   flb_input_chunk.c
+  flb_input_ingest.c
   flb_input_log.c
   flb_input_metric.c
   flb_input_trace.c
@@ -35,6 +38,7 @@ set(src
   flb_output.c
   flb_output_thread.c
   flb_config.c
+  flb_fips.c
   flb_config_map.c
   flb_socket.c
   flb_network.c
@@ -43,16 +47,20 @@ set(src
   flb_engine.c
   flb_engine_dispatch.c
   flb_task.c
+  flb_search_bulk.c
   flb_unescape.c
   flb_scheduler.c
   flb_io.c
   flb_storage.c
   flb_connection.c
   flb_downstream.c
+  flb_downstream_worker.c
   flb_upstream.c
   flb_upstream_ha.c
   flb_upstream_node.c
   flb_router.c
+  flb_router_condition.c
+  flb_router_config.c
   flb_worker.c
   flb_coro.c
   flb_time.c
@@ -62,6 +70,7 @@ set(src
   flb_crypto.c
   flb_random.c
   flb_plugin.c
+  flb_plugin_alias.c
   flb_gzip.c
   flb_snappy.c
   flb_zstd.c
@@ -85,6 +94,7 @@ set(src
   flb_log_event_encoder_dynamic_field.c
   flb_processor.c
   flb_reload.c
+  flb_supervisor.c
   flb_msgpack_append_message.c
   flb_notification.c
   flb_lock.c
@@ -112,6 +122,10 @@ endif()
 set(src
   ${src}
   opentelemetry/flb_opentelemetry_logs.c
+  opentelemetry/flb_opentelemetry_metrics.c
+  opentelemetry/flb_opentelemetry_otlp_json.c
+  opentelemetry/flb_opentelemetry_otlp_proto.c
+  opentelemetry/flb_opentelemetry_traces.c
   opentelemetry/flb_opentelemetry_utils.c
 )
 
@@ -156,6 +170,7 @@ if(FLB_TLS)
     ${src}
     "tls/flb_tls.c"
     "flb_oauth2.c"
+    "flb_oauth2_jwt.c"
     )
 
   # Make sure our output targets links to the TLS library
@@ -358,6 +373,11 @@ if(FLB_UNICODE_ENCODER)
   add_subdirectory(simdutf)
 endif()
 
+# ripser
+if(FLB_RIPSER)
+  add_subdirectory(ripser)
+endif()
+
 # WAMRC compiler
 if(FLB_WAMRC)
   add_subdirectory(wamrc)
@@ -412,6 +432,13 @@ set(FLB_DEPS
   ${NGHTTP2_LIBRARIES}
   )
 
+if(FLB_YYJSON)
+  set(FLB_DEPS
+    ${FLB_DEPS}
+    yyjson
+    )
+endif()
+
 if(OPENSSL_FOUND)
   set(FLB_DEPS
     ${FLB_DEPS}
@@ -441,6 +468,16 @@ set(FLB_DEPS
   ${FLB_DEPS}
   simdutf-static
   flb-simdutf-connector-static
+  )
+endif()
+
+
+# Ripser
+if(FLB_RIPSER)
+set(FLB_DEPS
+  ${FLB_DEPS}
+  ripser-static
+  flb-ripser-wrapper-static
   )
 endif()
 
@@ -490,7 +527,9 @@ set(flb_rc_files
 endif()
 
 # Shared Library
-if(FLB_SHARED_LIB)
+if(FLB_SHARED_LIB OR
+   (NOT MSVC AND NOT FLB_JEMALLOC AND
+    (FLB_TESTS_RUNTIME OR FLB_TESTS_INTERNAL OR FLB_TESTS_INTERNAL_FUZZ)))
   add_library(fluent-bit-shared SHARED ${src})
   add_sanitizers(fluent-bit-shared)
   set_target_properties(fluent-bit-shared
@@ -508,11 +547,13 @@ if(FLB_SHARED_LIB)
       PROPERTIES PDB_NAME fluent-bit.dll)
   endif()
 
-  # Library install routines
-  install(TARGETS fluent-bit-shared
-    LIBRARY DESTINATION ${FLB_INSTALL_LIBDIR}
-    COMPONENT library
-    RUNTIME DESTINATION ${FLB_INSTALL_BINDIR})
+  if(FLB_SHARED_LIB)
+    # Library install routines
+    install(TARGETS fluent-bit-shared
+      LIBRARY DESTINATION ${FLB_INSTALL_LIBDIR}
+      COMPONENT library
+      RUNTIME DESTINATION ${FLB_INSTALL_BINDIR})
+  endif()
 endif()
 
 # Static Library

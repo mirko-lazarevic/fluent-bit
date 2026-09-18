@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,11 +32,15 @@
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_plugin.h>
 #include <fluent-bit/flb_reload.h>
+#include <fluent-bit/flb_time.h>
 
 #include <cfl/cfl.h>
 #include <cfl/cfl_sds.h>
 #include <cfl/cfl_variant.h>
 #include <cfl/cfl_kvlist.h>
+
+#include <fluent-bit/flb_pthread.h>
+#include <stdlib.h>
 
 static int flb_input_propery_check_all(struct flb_config *config)
 {
@@ -305,6 +309,7 @@ int flb_reload_reconstruct_cf(struct flb_cf *src_cf, struct flb_cf *dest_cf)
 {
     struct mk_list *head;
     struct flb_cf_section *s;
+    struct flb_cf_env_var *ev;
     struct flb_kv *kv;
 
     mk_list_foreach(head, &src_cf->sections) {
@@ -316,10 +321,12 @@ int flb_reload_reconstruct_cf(struct flb_cf *src_cf, struct flb_cf *dest_cf)
 
     /* Copy and store env. (For yaml cf.) */
     mk_list_foreach(head, &src_cf->env) {
-        kv = mk_list_entry(head, struct flb_kv, _head);
-        if (!flb_cf_env_property_add(dest_cf,
-                                     kv->key, cfl_sds_len(kv->key),
-                                     kv->val, cfl_sds_len(kv->val))) {
+        ev = mk_list_entry(head, struct flb_cf_env_var, _head);
+        if (!flb_cf_env_var_add(dest_cf,
+                                ev->name, ev->name ? flb_sds_len(ev->name) : 0,
+                                ev->value, ev->value ? flb_sds_len(ev->value) : 0,
+                                ev->uri, ev->uri ? flb_sds_len(ev->uri) : 0,
+                                ev->refresh_interval)) {
             return -1;
         }
 
@@ -376,6 +383,81 @@ static int flb_reload_reinstantiate_external_plugins(struct flb_config *src, str
     return 0;
 }
 
+struct flb_reload_watchdog_ctx {
+    pthread_t tid;
+    int timeout_seconds;
+    volatile int should_stop;
+};
+
+static void *hot_reload_watchdog_thread(void *arg)
+{
+    int elapsed_ms = 0;
+    int timeout_ms;
+    struct flb_reload_watchdog_ctx *ctx = (struct flb_reload_watchdog_ctx *)arg;
+
+    timeout_ms = ctx->timeout_seconds * 1000;
+
+    /* Check should_stop flag every 100ms while tracking elapsed time */
+    while (elapsed_ms < timeout_ms) {
+        if (ctx->should_stop) {
+            /* Clean shutdown requested */
+            return NULL;
+        }
+        flb_time_msleep(100);
+        elapsed_ms += 100;
+    }
+
+    /* Only abort if we timed out, not if cleanly signaled to stop */
+    flb_error("[hot_reload_watchdog] Hot reload timeout exceeded (%d seconds), "
+                "aborting to prevent indefinite hang", ctx->timeout_seconds);
+    abort();
+}
+
+static struct flb_reload_watchdog_ctx *flb_reload_watchdog_start(struct flb_config *config)
+{
+    struct flb_reload_watchdog_ctx *watchdog_ctx;
+    int ret;
+
+    if (config->hot_reload_watchdog_timeout_seconds <= 0) {
+        flb_debug("[reload] Hot reload watchdog disabled");
+        return NULL;
+    }
+
+    watchdog_ctx = flb_malloc(sizeof(struct flb_reload_watchdog_ctx));
+    if (!watchdog_ctx) {
+        flb_errno();
+        return NULL;
+    }
+    watchdog_ctx->timeout_seconds = config->hot_reload_watchdog_timeout_seconds;
+    watchdog_ctx->should_stop = 0;
+
+    ret = pthread_create(&watchdog_ctx->tid, NULL, hot_reload_watchdog_thread, watchdog_ctx);
+    if (ret != 0) {
+        flb_error("[reload] Failed to create hot reload watchdog thread: %d", ret);
+        flb_free(watchdog_ctx);
+        return NULL;
+    }
+
+    flb_debug("[reload] Hot reload watchdog thread started");
+    return watchdog_ctx;
+}
+
+static void flb_reload_watchdog_cleanup(struct flb_reload_watchdog_ctx *watchdog_ctx)
+{
+    if (!watchdog_ctx) {
+        return;
+    }
+
+    /* Signal thread to stop cooperatively */
+    watchdog_ctx->should_stop = 1;
+
+    /* Wait for graceful thread exit */
+    pthread_join(watchdog_ctx->tid, NULL);
+    flb_debug("[reload] Hot reload watchdog thread stopped");
+
+    flb_free(watchdog_ctx);
+}
+
 int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
 {
     int ret;
@@ -384,9 +466,11 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
     struct flb_config *new_config;
     flb_ctx_t *new_ctx = NULL;
     struct flb_cf *new_cf;
+    struct flb_cf *loaded_cf;
     struct flb_cf *original_cf;
     int verbose;
     int reloaded_count = 0;
+    struct flb_reload_watchdog_ctx *watchdog_ctx = NULL;
 
     if (ctx == NULL) {
         flb_error("[reload] given flb context is NULL");
@@ -417,6 +501,9 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
              (long unsigned int) getpid(),
              (void *) pthread_self());
 
+    /* Start the watchdog thread */
+    watchdog_ctx = flb_reload_watchdog_start(old_config);
+
     if (old_config->conf_path_file) {
         file = flb_sds_create(old_config->conf_path_file);
     }
@@ -427,6 +514,7 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
             }
             flb_cf_destroy(new_cf);
             flb_error("[reload] reconstruct cf failed");
+            flb_reload_watchdog_cleanup(watchdog_ctx);
             return FLB_RELOAD_HALTED;
         }
     }
@@ -439,11 +527,25 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
         }
         flb_cf_destroy(new_cf);
         flb_error("[reload] creating flb context is failed. Reloading is halted");
-
+        flb_reload_watchdog_cleanup(watchdog_ctx);
         return FLB_RELOAD_HALTED;
     }
 
     new_config = new_ctx->config;
+
+    if (old_config->conf_path) {
+        new_config->conf_path = flb_strdup(old_config->conf_path);
+        if (!new_config->conf_path) {
+            if (file != NULL) {
+                flb_sds_destroy(file);
+            }
+            flb_cf_destroy(new_cf);
+            flb_destroy(new_ctx);
+            flb_error("[reload] copying configuration path failed. Reloading is halted");
+            flb_reload_watchdog_cleanup(watchdog_ctx);
+            return FLB_RELOAD_HALTED;
+        }
+    }
 
     /* Inherit verbose from the old ctx instance */
     verbose = ctx->config->verbose;
@@ -464,14 +566,18 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
 
     /* Create another config format context */
     if (file != NULL) {
-        new_cf = flb_cf_create_from_file(new_cf, file);
+        loaded_cf = flb_cf_create_from_file(new_cf, file);
 
-        if (!new_cf) {
+        if (!loaded_cf) {
             flb_sds_destroy(file);
+            flb_cf_destroy(new_cf);
+            flb_destroy(new_ctx);
             old_config->hot_reloading = FLB_FALSE;
-
+            flb_reload_watchdog_cleanup(watchdog_ctx);
             return FLB_RELOAD_HALTED;
         }
+
+        new_cf = loaded_cf;
     }
 
     /* Load external plugins via command line */
@@ -485,7 +591,7 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
             flb_destroy(new_ctx);
             old_config->hot_reloading = FLB_FALSE;
             flb_error("[reload] reloaded config is invalid. Reloading is halted");
-
+            flb_reload_watchdog_cleanup(watchdog_ctx);
             return FLB_RELOAD_HALTED;
         }
     }
@@ -499,7 +605,20 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
         old_config->hot_reloading = FLB_FALSE;
 
         flb_error("[reload] reloaded config format is invalid. Reloading is halted");
+        flb_reload_watchdog_cleanup(watchdog_ctx);
+        return FLB_RELOAD_HALTED;
+    }
 
+    if (new_config->fips_mode != old_config->fips_mode) {
+        if (file != NULL) {
+            flb_sds_destroy(file);
+        }
+        flb_cf_destroy(new_cf);
+        flb_destroy(new_ctx);
+        old_config->hot_reloading = FLB_FALSE;
+
+        flb_error("[reload] security.fips_mode cannot be changed by hot reload");
+        flb_reload_watchdog_cleanup(watchdog_ctx);
         return FLB_RELOAD_HALTED;
     }
 
@@ -512,7 +631,7 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
         old_config->hot_reloading = FLB_FALSE;
 
         flb_error("[reload] reloaded config is invalid. Reloading is halted");
-
+        flb_reload_watchdog_cleanup(watchdog_ctx);
         return FLB_RELOAD_HALTED;
     }
 
@@ -537,11 +656,15 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
     ret = flb_start(new_ctx);
 
     if (ret != 0) {
+        /*
+         * 'ctx' and its config were already destroyed above, so do not
+         * dereference old_config here.
+         */
+        new_config->hot_reloading = FLB_FALSE;
         flb_destroy(new_ctx);
-        old_config->hot_reloading = FLB_FALSE;
 
         flb_error("[reload] loaded configuration contains error(s). Reloading is aborted");
-
+        flb_reload_watchdog_cleanup(watchdog_ctx);
         return FLB_RELOAD_ABORTED;
     }
 
@@ -549,6 +672,12 @@ int flb_reload(flb_ctx_t *ctx, struct flb_cf *cf_opts)
     new_config->hot_reloaded_count = reloaded_count;
     flb_debug("[reload] hot reloaded %d time(s)", reloaded_count);
     new_config->hot_reloading = FLB_FALSE;
+    new_config->hot_reload_succeeded = FLB_TRUE;
+    
+    /* Cancel the watchdog thread since reload completed successfully */
+    flb_debug("[reload] cleanup watchdog");
+    flb_reload_watchdog_cleanup(watchdog_ctx);
 
+    flb_info("[reload] successful reload done.");
     return 0;
 }

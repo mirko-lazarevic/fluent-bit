@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -230,7 +230,7 @@ static void cb_slack_flush(struct flb_event_chunk *event_chunk,
     flb_sds_destroy(json);
 
     /* Re-format mspgack as JSON */
-    out_buf = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size);
+    out_buf = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size, config->json_escape_unicode);
     if (!out_buf) {
         msgpack_sbuffer_destroy(&mp_sbuf);
         FLB_OUTPUT_RETURN(FLB_RETRY);
@@ -282,8 +282,8 @@ static void cb_slack_flush(struct flb_event_chunk *event_chunk,
         out_ret = FLB_RETRY;
     }
 
-    flb_upstream_conn_release(u_conn);
     flb_http_client_destroy(c);
+    flb_upstream_conn_release(u_conn);
     flb_sds_destroy(out_buf);
     FLB_OUTPUT_RETURN(out_ret);
 }

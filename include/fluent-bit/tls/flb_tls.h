@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,9 @@
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_coro.h>
+#include <fluent-bit/flb_pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define FLB_TLS_ALPN_MAX_LENGTH 16
 
@@ -46,9 +48,22 @@
 
 #define FLB_TLS_CLIENT_MODE 0
 #define FLB_TLS_SERVER_MODE 1
+#define FLB_TLS_CLIENT_MODE_DGRAM 2
+#define FLB_TLS_SERVER_MODE_DGRAM 3
 
 struct flb_tls;
 struct flb_connection;
+
+struct flb_tls_file_status {
+    int exists;
+    uint64_t size;
+    uint64_t device;
+    uint64_t inode;
+    uint64_t mtime;
+    uint64_t mtime_nsec;
+    uint64_t ctime;
+    uint64_t ctime_nsec;
+};
 
 struct flb_tls_session {
     /* opaque data type for backend session context */
@@ -71,11 +86,15 @@ struct flb_tls_backend {
                              const char *, const char *,
                              const char *, const char *);
 
+    /* reload backend context */
+    int (*context_reload) (struct flb_tls *);
+
     /* destroy backend context */
     void (*context_destroy) (void *);
 
     /* Additional settings */
     int (*context_alpn_set) (void *, const char *);
+    int (*context_set_verify_client) (void *, int);
 
     /* TLS Protocol version */
     int (*set_minmax_proto) (struct flb_tls *tls, const char *, const char *);
@@ -84,8 +103,17 @@ struct flb_tls_backend {
 
     /* Session management */
     void *(*session_create) (struct flb_tls *, int);
+    void (*session_invalidate) (void *);
     int (*session_destroy) (void *);
     const char *(*session_alpn_get) (void *);
+    /*
+     * Chain an inner TLS session's I/O through an outer TLS session.
+     * Used for TLS-in-TLS when connecting through an HTTPS proxy: after
+     * HTTP CONNECT is established over the proxy TLS, the destination TLS
+     * handshake data must be sent through (and encrypted by) the proxy TLS.
+     * Optional: may be NULL if the backend does not support it.
+     */
+    int (*session_set_outer) (void *inner, void *outer);
 
     /* I/O */
     int (*net_read) (struct flb_tls_session *, void *, size_t);
@@ -96,24 +124,42 @@ struct flb_tls_backend {
 #if defined(FLB_SYSTEM_WINDOWS)
     int (*set_certstore_name)(struct flb_tls *tls, const char *certstore_name);
     int (*set_use_enterprise_store)(struct flb_tls *tls, int use_enterprise);
+    int (*set_client_thumbprints)(struct flb_tls *tls, const char *thumbprints);
 #endif
 };
 
 /* Main TLS context */
 struct flb_tls {
     int verify;                       /* FLB_TRUE | FLB_FALSE      */
+    int verify_client;                /* Verify client certificate */
     int debug;                        /* Debug level               */
     char *vhost;                      /* Virtual hostname for SNI  */
+    char *ca_path;                    /* Path to certificates      */
+    char *ca_file;                    /* CA root cert              */
+    char *crt_file;                   /* Certificate               */
+    char *key_file;                   /* Cert Key                  */
+    char *key_passwd;                 /* Cert Key Password         */
+    char *alpn;                       /* ALPN protocol list        */
+    char *min_version;                /* Minimum TLS version       */
+    char *max_version;                /* Maximum TLS version       */
+    char *ciphers;                    /* TLS ciphers               */
+    struct flb_tls_file_status ca_path_status;
+    struct flb_tls_file_status ca_file_status;
+    struct flb_tls_file_status crt_file_status;
+    struct flb_tls_file_status key_file_status;
     int mode;                         /* Client or Server          */
     int verify_hostname;              /* Verify hostname           */
+    int system_certificates_loaded;    /* System certs loaded       */
 #if defined(FLB_SYSTEM_WINDOWS)
     char *certstore_name;             /* Windows CertStore Name    */
     int use_enterprise_store;         /* Use Enterprise store or not */
+    char *client_thumbprints;         /* Allowed client thumbprints */
 #endif
 
     /* Bakend library for TLS */
     void *ctx;                        /* TLS context created */
     struct flb_tls_backend *api;      /* backend API */
+    pthread_mutex_t reload_mutex;     /* protects reload state */
 };
 
 int flb_tls_init();
@@ -128,12 +174,16 @@ struct flb_tls *flb_tls_create(int mode,
 
 int flb_tls_destroy(struct flb_tls *tls);
 
+int flb_tls_reload_if_needed(struct flb_tls *tls);
+
 int flb_tls_set_alpn(struct flb_tls *tls, const char *alpn);
+int flb_tls_set_verify_client(struct flb_tls *tls, int verify_client);
 
 int flb_tls_set_verify_hostname(struct flb_tls *tls, int verify_hostname);
 #if defined(FLB_SYSTEM_WINDOWS)
 int flb_tls_set_certstore_name(struct flb_tls *tls, const char *certstore_name);
 int flb_tls_set_use_enterprise_store(struct flb_tls *tls, int use_enterprise);
+int flb_tls_set_client_thumbprints(struct flb_tls *tls, const char *thumbprints);
 #endif
 
 int flb_tls_load_system_certificates(struct flb_tls *tls);
@@ -144,6 +194,7 @@ int flb_tls_set_ciphers(struct flb_tls *tls, const char *ciphers);
 struct mk_list *flb_tls_get_config_map(struct flb_config *config);
 
 int flb_tls_session_destroy(struct flb_tls_session *session);
+int flb_tls_session_invalidate(struct flb_tls_session *session);
 
 int flb_tls_session_create(struct flb_tls *tls,
                            struct flb_connection *connection,

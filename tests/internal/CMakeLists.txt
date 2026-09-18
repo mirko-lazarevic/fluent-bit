@@ -10,8 +10,11 @@ set(UNIT_TESTS_FILES
   hmac.c
   crypto.c
   hash.c
+  fips.c
+  kv.c
   slist.c
   router.c
+  router_config.c
   network.c
   unit_sizes.c
   hashtable.c
@@ -20,9 +23,14 @@ set(UNIT_TESTS_FILES
   gzip.c
   zstd.c
   random.c
+  thread_storage.c
+  config_service.c
   config_map.c
   mp.c
+  mp_chunk_cobj.c
   input_chunk.c
+  input_chunk_routes.c
+  input_pause.c
   flb_time.c
   file.c
   csv.c
@@ -30,9 +38,11 @@ set(UNIT_TESTS_FILES
   typecast.c
   base64.c
   bucket_queue.c
+  downstream_worker.c
   flb_event_loop.c
   ring_buffer.c
   regex.c
+  scheduler.c
   parser_json.c
   parser_ltsv.c
   parser_regex.c
@@ -49,14 +59,37 @@ set(UNIT_TESTS_FILES
   endianness.c
   task_map.c
   strptime.c
+  plugin_alias.c
   storage_inherit.c
   unicode.c
   opentelemetry.c
+  storage_dlq.c
+  engine_adaptive_flush.c
+  engine_dispatch.c
+  search_bulk.c
 )
+
+if(FLB_OUT_AZURE_BLOB)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    azure_blob_path.c
+    )
+endif()
+
+# TLS helpers
+if(FLB_TLS)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    upstream_tls.c
+    oauth2_jwt.c
+    oauth2.c
+    )
+endif()
 
 # Config format
 set(UNIT_TESTS_FILES
     ${UNIT_TESTS_FILES}
+    config.c
     config_format.c
     config_format_fluentbit.c
 )
@@ -102,7 +135,16 @@ endif()
 if(FLB_METRICS)
   set(UNIT_TESTS_FILES
     ${UNIT_TESTS_FILES}
+    input_rate_gate.c
     metrics.c
+    cumulative_to_delta.c
+    )
+endif()
+
+if(FLB_HTTP_SERVER)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    http_server.c
     )
 endif()
 
@@ -120,11 +162,19 @@ if(FLB_AVRO_ENCODER)
     )
 endif()
 
+if(FLB_AVRO_ENCODER OR FLB_PROTOBUF_ENCODER)
+  list(APPEND UNIT_TESTS_FILES kafka_schema_registry.c)
+endif()
+if(FLB_PROTOBUF_ENCODER)
+  list(APPEND UNIT_TESTS_FILES kafka_protobuf.c)
+endif()
+
 if(FLB_AWS)
   set(UNIT_TESTS_FILES
     ${UNIT_TESTS_FILES}
     aws_util.c
     aws_compress.c
+    aws_aggregation.c
     aws_credentials.c
     aws_credentials_ec2.c
     aws_credentials_sts.c
@@ -153,7 +203,15 @@ if(FLB_LUAJIT)
     )
 endif()
 
+if(FLB_RIPSER)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    ripser.c
+    )
+endif()
+
 set(UNIT_TESTS_DATA
+  data/fips/disabled.cnf
   data/tls/certificate.pem
   data/tls/private_key.pem
   data/pack/json_single_map_001.json
@@ -162,7 +220,8 @@ set(UNIT_TESTS_DATA
   data/parser/regex.conf
   data/input_chunk/log/a_thousand_plus_one_bytes.log
   data/input_chunk/log/test_buffer_valid.log
-  data/opentelemetry/test_cases.json
+  data/opentelemetry/logs.json
+  data/opentelemetry/metrics.json
   )
 
 set(FLB_TESTS_DATA_PATH ${CMAKE_CURRENT_SOURCE_DIR}/)
@@ -204,11 +263,17 @@ function(prepare_unit_tests TEST_PREFIX SOURCEFILES)
         target_link_libraries(${source_file_we} flb-aws)
       endif()
 
+      if(FLB_OUT_AZURE_BLOB AND
+         "${source_file_we}" STREQUAL "flb-it-azure_blob_path" AND
+         "${FLB_TEST_LINK_LIBRARY}" STREQUAL "fluent-bit-static")
+        target_link_libraries(${source_file_we} flb-plugin-out_azure_blob)
+      endif()
+
       if(FLB_STREAM_PROCESSOR)
         target_link_libraries(${source_file_we} flb-sp)
       endif()
 
-      target_link_libraries(${source_file_we} fluent-bit-static cfl-static)
+      target_link_libraries(${source_file_we} ${FLB_TEST_LINK_LIBRARY} cfl-static)
 
       if(FLB_AVRO_ENCODER)
         target_link_libraries(${source_file_we} avro-static jansson)
@@ -224,6 +289,87 @@ endfunction(prepare_unit_tests)
 
 prepare_unit_tests(flb-it- "${UNIT_TESTS_FILES}")
 
+if(TARGET flb-it-engine_dispatch)
+  target_include_directories(flb-it-engine_dispatch PRIVATE
+    ${PROJECT_SOURCE_DIR}/lib/chunkio/deps)
+endif()
+
+option(FLB_TESTS_FIPS_ENABLED "Run tests that require an installed OpenSSL FIPS provider" OFF)
+if(TARGET flb-it-fips)
+  if(FLB_OUT_S3)
+    target_compile_definitions(flb-it-fips PRIVATE FLB_TEST_FIPS_S3)
+  endif()
+
+  set(FLB_TEST_FIPS_DISABLED_CONFIG
+      "${CMAKE_CURRENT_BINARY_DIR}/data/fips/disabled.cnf")
+  set(FLB_TEST_FIPS_MISSING_MODULES
+      "${CMAKE_CURRENT_BINARY_DIR}/data/fips/missing-modules")
+  set(FLB_TEST_FIPS_UNAVAILABLE_ENV
+      "FLB_TEST_FIPS_MODE=unavailable"
+      "OPENSSL_CONF=${FLB_TEST_FIPS_DISABLED_CONFIG}"
+      "OPENSSL_MODULES=${FLB_TEST_FIPS_MISSING_MODULES}")
+  set(FLB_TEST_FIPS_DISABLED_ENV
+      "FLB_TEST_FIPS_MODE=disabled"
+      "OPENSSL_CONF=${FLB_TEST_FIPS_DISABLED_CONFIG}"
+      "OPENSSL_MODULES=${FLB_TEST_FIPS_MISSING_MODULES}")
+
+  set_tests_properties(flb-it-fips PROPERTIES
+    ENVIRONMENT "${FLB_TEST_FIPS_DISABLED_ENV}")
+
+  add_test(NAME flb-it-fips-unavailable
+    COMMAND $<TARGET_FILE:flb-it-fips>)
+  set_tests_properties(flb-it-fips-unavailable PROPERTIES
+    LABELS "internal"
+    ENVIRONMENT "${FLB_TEST_FIPS_UNAVAILABLE_ENV}")
+
+  if(FLB_TESTS_FIPS_ENABLED)
+    add_test(NAME flb-it-fips-enabled
+      COMMAND $<TARGET_FILE:flb-it-fips>)
+    set_tests_properties(flb-it-fips-enabled PROPERTIES
+      LABELS "internal"
+      ENVIRONMENT "FLB_TEST_FIPS_MODE=enabled")
+
+    add_test(NAME flb-it-fips-preenabled
+      COMMAND $<TARGET_FILE:flb-it-fips>)
+    set_tests_properties(flb-it-fips-preenabled PROPERTIES
+      LABELS "internal"
+      ENVIRONMENT "FLB_TEST_FIPS_MODE=preenabled")
+  endif()
+endif()
+
+if(FLB_METRICS AND FLB_PROCESSOR_CUMULATIVE_TO_DELTA)
+  set(CUMULATIVE_TO_DELTA_PLUGIN_DIR
+    ${PROJECT_SOURCE_DIR}/plugins/processor_cumulative_to_delta)
+  set(CUMULATIVE_TO_DELTA_CORE_SOURCE
+    ${CUMULATIVE_TO_DELTA_PLUGIN_DIR}/cumulative_to_delta_core.c)
+
+  target_sources(flb-it-cumulative_to_delta PRIVATE
+    ${CUMULATIVE_TO_DELTA_CORE_SOURCE})
+  target_include_directories(flb-it-cumulative_to_delta PRIVATE
+    ${CUMULATIVE_TO_DELTA_PLUGIN_DIR})
+endif()
+
+if(FLB_AVRO_ENCODER OR FLB_PROTOBUF_ENCODER)
+  target_link_libraries(flb-it-kafka_schema_registry jansson)
+  target_sources(flb-it-kafka_schema_registry PRIVATE
+    ${PROJECT_SOURCE_DIR}/plugins/out_kafka/kafka_schema_registry.c)
+  target_include_directories(flb-it-kafka_schema_registry PRIVATE
+    ${PROJECT_SOURCE_DIR}/plugins/out_kafka)
+  if(DEFINED KAFKA_INCLUDEDIR)
+    target_include_directories(flb-it-kafka_schema_registry PRIVATE
+      ${KAFKA_INCLUDEDIR}/librdkafka)
+  endif()
+endif()
+
 if(FLB_TESTS_INTERNAL_FUZZ)
   add_subdirectory(fuzzers)
+endif()
+
+if(FLB_PROTOBUF_ENCODER)
+  foreach(test_target flb-it-kafka_schema_registry flb-it-kafka_protobuf)
+    target_sources(${test_target} PRIVATE ${PROJECT_SOURCE_DIR}/plugins/out_kafka/kafka_protobuf.cpp)
+    target_include_directories(${test_target} PRIVATE ${PROJECT_SOURCE_DIR}/plugins/out_kafka)
+    target_compile_features(${test_target} PRIVATE cxx_std_11)
+    target_link_libraries(${test_target} protobuf::libprotobuf protobuf::libprotoc)
+  endforeach()
 endif()

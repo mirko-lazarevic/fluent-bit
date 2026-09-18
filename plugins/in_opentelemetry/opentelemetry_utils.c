@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -67,91 +67,117 @@ int find_map_entry_by_key(msgpack_object_map *map,
     return -1;
 }
 
-int json_payload_get_wrapped_value(msgpack_object *wrapper,
-                                   msgpack_object **value,
-                                   int            *type)
+static int opentelemetry_content_type_matches(const char *content_type,
+                                              const char *expected_content_type)
 {
-    int                 internal_type;
-    msgpack_object     *kv_value;
-    msgpack_object_str *kv_key;
-    msgpack_object_map *map;
+    size_t content_length;
+    size_t expected_length;
+    char trailing_character;
 
-    if (wrapper->type != MSGPACK_OBJECT_MAP) {
-        return -1;
+    if (content_type == NULL || expected_content_type == NULL) {
+        return FLB_FALSE;
     }
 
-    map = &wrapper->via.map;
-    kv_value = NULL;
-    internal_type = -1;
+    expected_length = strlen(expected_content_type);
+    content_length = strlen(content_type);
 
-    if (map->size == 1) {
-        if (map->ptr[0].key.type == MSGPACK_OBJECT_STR) {
-            kv_value = &map->ptr[0].val;
-            kv_key = &map->ptr[0].key.via.str;
-
-            if (strncasecmp(kv_key->ptr, "stringValue",  kv_key->size) == 0 ||
-                strncasecmp(kv_key->ptr, "string_value", kv_key->size) == 0) {
-                internal_type = MSGPACK_OBJECT_STR;
-            }
-            else if (strncasecmp(kv_key->ptr, "boolValue",  kv_key->size) == 0 ||
-                     strncasecmp(kv_key->ptr, "bool_value", kv_key->size) == 0) {
-                internal_type = MSGPACK_OBJECT_BOOLEAN;
-            }
-            else if (strncasecmp(kv_key->ptr, "intValue",  kv_key->size) == 0 ||
-                     strncasecmp(kv_key->ptr, "int_value", kv_key->size) == 0) {
-                internal_type = MSGPACK_OBJECT_POSITIVE_INTEGER;
-            }
-            else if (strncasecmp(kv_key->ptr, "doubleValue",  kv_key->size) == 0 ||
-                     strncasecmp(kv_key->ptr, "double_value", kv_key->size) == 0) {
-                internal_type = MSGPACK_OBJECT_FLOAT;
-            }
-            else if (strncasecmp(kv_key->ptr, "bytesValue",  kv_key->size) == 0 ||
-                     strncasecmp(kv_key->ptr, "bytes_value", kv_key->size) == 0) {
-                internal_type = MSGPACK_OBJECT_BIN;
-            }
-            else if (strncasecmp(kv_key->ptr, "arrayValue",  kv_key->size) == 0 ||
-                     strncasecmp(kv_key->ptr, "array_value", kv_key->size) == 0) {
-                internal_type = MSGPACK_OBJECT_ARRAY;
-            }
-            else if (strncasecmp(kv_key->ptr, "kvlistValue",  kv_key->size) == 0 ||
-                     strncasecmp(kv_key->ptr, "kvlist_value", kv_key->size) == 0) {
-                internal_type = MSGPACK_OBJECT_MAP;
-            }
-        }
+    if (content_length < expected_length) {
+        return FLB_FALSE;
     }
 
-    if (internal_type != -1) {
-        if (type != NULL) {
-            *type  = internal_type;
-        }
-
-        if (value != NULL) {
-            *value = kv_value;
-        }
-
-        if (kv_value->type == MSGPACK_OBJECT_MAP) {
-            map = &kv_value->via.map;
-
-            if (map->size == 1) {
-                kv_value = &map->ptr[0].val;
-                kv_key = &map->ptr[0].key.via.str;
-
-                if (strncasecmp(kv_key->ptr, "values", kv_key->size) == 0) {
-                    if (value != NULL) {
-                        *value = kv_value;
-                    }
-                }
-                else {
-                    return -3;
-                }
-            }
-        }
-    }
-    else {
-        return -2;
+    if (strncasecmp(content_type, expected_content_type, expected_length) != 0) {
+        return FLB_FALSE;
     }
 
-    return 0;
+    trailing_character = content_type[expected_length];
+
+    if (trailing_character == '\0' ||
+        trailing_character == ';' ||
+        trailing_character == ' ' ||
+        trailing_character == '\t') {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+int opentelemetry_is_grpc_content_type(const char *content_type)
+{
+    size_t content_length;
+
+    if (content_type == NULL) {
+        return FLB_FALSE;
+    }
+
+    content_length = strlen(content_type);
+    if (content_length < 16) {
+        return FLB_FALSE;
+    }
+
+    if (strncasecmp(content_type, "application/grpc", 16) != 0) {
+        return FLB_FALSE;
+    }
+
+    if (content_type[16] == '\0' ||
+        content_type[16] == '+' ||
+        content_type[16] == ';' ||
+        content_type[16] == ' ' ||
+        content_type[16] == '\t') {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+int opentelemetry_is_json_content_type(const char *content_type)
+{
+    return opentelemetry_content_type_matches(content_type, "application/json");
+}
+
+int opentelemetry_is_protobuf_content_type(const char *content_type)
+{
+    if (opentelemetry_content_type_matches(content_type, "application/protobuf") ==
+        FLB_TRUE) {
+        return FLB_TRUE;
+    }
+
+    if (opentelemetry_content_type_matches(content_type,
+                                           "application/x-protobuf") == FLB_TRUE) {
+        return FLB_TRUE;
+    }
+
+    if (opentelemetry_is_grpc_content_type(content_type) == FLB_TRUE) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+int opentelemetry_payload_starts_with_json_object(const void *payload,
+                                                  size_t payload_size)
+{
+    size_t index;
+    const unsigned char *buffer;
+
+    if (payload == NULL || payload_size == 0) {
+        return FLB_FALSE;
+    }
+
+    buffer = (const unsigned char *) payload;
+
+    for (index = 0; index < payload_size; index++) {
+        if (isspace(buffer[index])) {
+            continue;
+        }
+
+        if (buffer[index] == '{') {
+            return FLB_TRUE;
+        }
+
+        return FLB_FALSE;
+    }
+
+    return FLB_FALSE;
 }
 
 static int hex_to_int(char ch)

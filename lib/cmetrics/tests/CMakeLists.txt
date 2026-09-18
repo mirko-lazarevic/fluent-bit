@@ -8,13 +8,19 @@ set(UNIT_TESTS_FILES
   atomic_operations.c
   encoding.c
   decoding.c
+  opentelemetry.c
   cat.c
   issues.c
   null_label.c
   filter.c
+  exp_histogram.c
+  msgpack_abi.c
+  msgpack_temporality.c
+  format_conversion.c
+  expire.c
   )
 
-if (CMT_BUILD_PROMETHEUS_DECODER)
+if (CMT_BUILD_PROMETHEUS_TEXT_DECODER)
     set(UNIT_TESTS_FILES
         ${UNIT_TESTS_FILES}
         prometheus_lexer.c

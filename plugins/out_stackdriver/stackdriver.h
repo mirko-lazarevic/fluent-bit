@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -136,12 +136,7 @@ struct flb_stackdriver {
     /* kubernetes specific */
     flb_sds_t cluster_name;
     flb_sds_t cluster_location;
-    flb_sds_t namespace_name;
-    flb_sds_t pod_name;
-    flb_sds_t container_name;
-    flb_sds_t node_name;
 
-    flb_sds_t local_resource_id;
     flb_sds_t tag_prefix;
     /* shadow tag_prefix for safe deallocation */
     flb_sds_t tag_prefix_k8s;
@@ -202,8 +197,12 @@ struct flb_stackdriver {
     /* environment variable settings */
     struct flb_stackdriver_env *env;
 
+    /* oauth2 cache reference */
+    int oauth2_cache_acquired;
+
     /* mutex for acquiring oauth tokens */
     pthread_mutex_t token_mutex;
+    int token_mutex_initialized;
 
     /* upstream context for stackdriver write end-point */
     struct flb_upstream *u;

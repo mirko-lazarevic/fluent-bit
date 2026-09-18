@@ -18,174 +18,245 @@
  */
 
 #include <cmetrics/cmetrics.h>
-#include <cmetrics/cmt_gauge.h>
 #include <cmetrics/cmt_counter.h>
-#include <cmetrics/cmt_untyped.h>
-#include <cmetrics/cmt_summary.h>
+#include <cmetrics/cmt_gauge.h>
 #include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_map.h>
+#include <cmetrics/cmt_metric.h>
 #include <cmetrics/cmt_encode_prometheus.h>
-#include <cmetrics/cmt_decode_opentelemetry.h>
-#include <cmetrics/cmt_encode_opentelemetry.h>
-#include <cmetrics/cmt_decode_prometheus_remote_write.h>
 #include <cmetrics/cmt_encode_prometheus_remote_write.h>
+#include <cmetrics/cmt_decode_prometheus_remote_write.h>
 #include <cmetrics/cmt_decode_statsd.h>
 
 #include "cmt_tests.h"
 
-static struct cmt *generate_encoder_test_data()
+static cfl_sds_t generate_remote_write_payload(char *extra_label_name,
+                                               char *extra_label_value)
 {
-    double                        quantiles[5];
-    struct cmt_histogram_buckets *buckets;
-    double                        val;
-    struct cmt                   *cmt;
-    uint64_t                      ts;
-    struct cmt_gauge             *g1;
-    struct cmt_counter           *c1;
-    struct cmt_summary           *s1;
-    struct cmt_histogram         *h1;
+    Prometheus__WriteRequest request;
+    Prometheus__TimeSeries time_series;
+    Prometheus__Label name_label;
+    Prometheus__Label extra_label;
+    Prometheus__Sample sample;
+    Prometheus__TimeSeries *time_series_list[1];
+    Prometheus__Label *label_list[2];
+    Prometheus__Sample *sample_list[1];
+    size_t payload_size;
+    unsigned char *packed_payload;
+    cfl_sds_t payload;
 
-    ts = 0;
-    cmt = cmt_create();
+    prometheus__write_request__init(&request);
+    prometheus__time_series__init(&time_series);
+    prometheus__label__init(&name_label);
+    prometheus__label__init(&extra_label);
+    prometheus__sample__init(&sample);
 
-    c1 = cmt_counter_create(cmt, "kubernetes", "network", "load_counter", "Network load counter",
-                            2, (char *[]) {"hostname", "app"});
+    name_label.name = "__name__";
+    name_label.value = "rw_metric";
+    extra_label.name = extra_label_name;
+    extra_label.value = extra_label_value;
 
-    cmt_counter_get_val(c1, 0, NULL, &val);
-    cmt_counter_inc(c1, ts, 0, NULL);
-    cmt_counter_add(c1, ts, 2, 0, NULL);
-    cmt_counter_get_val(c1, 0, NULL, &val);
+    label_list[0] = &name_label;
+    label_list[1] = &extra_label;
+    time_series.n_labels = 2;
+    time_series.labels = label_list;
 
-    cmt_counter_inc(c1, ts, 2, (char *[]) {"localhost", "cmetrics"});
-    cmt_counter_get_val(c1, 2, (char *[]) {"localhost", "cmetrics"}, &val);
-    cmt_counter_add(c1, ts, 10.55, 2, (char *[]) {"localhost", "test"});
-    cmt_counter_get_val(c1, 2, (char *[]) {"localhost", "test"}, &val);
-    cmt_counter_set(c1, ts, 12.15, 2, (char *[]) {"localhost", "test"});
-    cmt_counter_set(c1, ts, 1, 2, (char *[]) {"localhost", "test"});
+    sample.value = 1.0;
+    sample.timestamp = 123;
+    sample_list[0] = &sample;
+    time_series.n_samples = 1;
+    time_series.samples = sample_list;
 
-    g1 = cmt_gauge_create(cmt, "kubernetes", "network", "load_gauge", "Network load gauge", 0, NULL);
+    time_series_list[0] = &time_series;
+    request.n_timeseries = 1;
+    request.timeseries = time_series_list;
 
-    cmt_gauge_get_val(g1, 0, NULL, &val);
-    cmt_gauge_set(g1, ts, 2.0, 0, NULL);
-    cmt_gauge_get_val(g1, 0, NULL, &val);
-    cmt_gauge_inc(g1, ts, 0, NULL);
-    cmt_gauge_get_val(g1, 0, NULL, &val);
-    cmt_gauge_sub(g1, ts, 2, 0, NULL);
-    cmt_gauge_get_val(g1, 0, NULL, &val);
-    cmt_gauge_dec(g1, ts, 0, NULL);
-    cmt_gauge_get_val(g1, 0, NULL, &val);
-    cmt_gauge_inc(g1, ts, 0, NULL);
-
-    buckets = cmt_histogram_buckets_create(3, 0.05, 5.0, 10.0);
-
-    h1 = cmt_histogram_create(cmt,
-                              "k8s", "network", "load_histogram", "Network load histogram",
-                              buckets,
-                              1, (char *[]) {"my_label"});
-
-    cmt_histogram_observe(h1, ts, 0.001, 0, NULL);
-    cmt_histogram_observe(h1, ts, 0.020, 0, NULL);
-    cmt_histogram_observe(h1, ts, 5.0, 0, NULL);
-    cmt_histogram_observe(h1, ts, 8.0, 0, NULL);
-    cmt_histogram_observe(h1, ts, 1000, 0, NULL);
-
-    cmt_histogram_observe(h1, ts, 0.001, 1, (char *[]) {"my_val"});
-    cmt_histogram_observe(h1, ts, 0.020, 1, (char *[]) {"my_val"});
-    cmt_histogram_observe(h1, ts, 5.0, 1, (char *[]) {"my_val"});
-    cmt_histogram_observe(h1, ts, 8.0, 1, (char *[]) {"my_val"});
-    cmt_histogram_observe(h1, ts, 1000, 1, (char *[]) {"my_val"});;
-
-    quantiles[0] = 0.1;
-    quantiles[1] = 0.2;
-    quantiles[2] = 0.3;
-    quantiles[3] = 0.4;
-    quantiles[4] = 0.5;
-
-    s1 = cmt_summary_create(cmt,
-                            "k8s", "disk", "load_summary", "Disk load summary",
-                            5, quantiles,
-                            1, (char *[]) {"my_label"});
-
-    quantiles[0] = 1.1;
-    quantiles[1] = 2.2;
-    quantiles[2] = 3.3;
-    quantiles[3] = 4.4;
-    quantiles[4] = 5.5;
-
-    cmt_summary_set_default(s1, ts, quantiles, 51.612894511314444, 10, 0, NULL);
-
-    quantiles[0] = 11.11;
-    quantiles[1] = 0;
-    quantiles[2] = 33.33;
-    quantiles[3] = 44.44;
-    quantiles[4] = 55.55;
-
-    cmt_summary_set_default(s1, ts, quantiles, 51.612894511314444, 10, 1, (char *[]) {"my_val"});
-
-    return cmt;
-}
-
-void test_opentelemetry()
-{
-    cfl_sds_t        reference_prometheus_context;
-    cfl_sds_t        opentelemetry_context;
-    struct cfl_list  decoded_context_list;
-    cfl_sds_t        prometheus_context;
-    struct cmt      *decoded_context;
-    size_t           offset;
-    int              result;
-    struct cmt      *cmt;
-
-    offset = 0;
-
-    cmt_initialize();
-
-    cmt = generate_encoder_test_data();
-    TEST_CHECK(cmt != NULL);
-
-    reference_prometheus_context = cmt_encode_prometheus_create(cmt, CMT_TRUE);
-    TEST_CHECK(reference_prometheus_context != NULL);
-
-    if (reference_prometheus_context != NULL) {
-        opentelemetry_context = cmt_encode_opentelemetry_create(cmt);
-        TEST_CHECK(opentelemetry_context != NULL);
-
-        if (opentelemetry_context != NULL) {
-            result = cmt_decode_opentelemetry_create(&decoded_context_list,
-                                                     opentelemetry_context,
-                                                     cfl_sds_len(opentelemetry_context),
-                                                     &offset);
-
-            if (TEST_CHECK(result == 0)) {
-                decoded_context = cfl_list_entry_first(&decoded_context_list, struct cmt, _head);
-
-                if (TEST_CHECK(result == 0)) {
-                    prometheus_context = cmt_encode_prometheus_create(decoded_context,
-                                                                      CMT_TRUE);
-                    TEST_CHECK(prometheus_context != NULL);
-
-                    if (prometheus_context != NULL) {
-                        TEST_CHECK(strcmp(prometheus_context,
-                                          reference_prometheus_context) == 0);
-
-                        cmt_encode_prometheus_destroy(prometheus_context);
-                    }
-                }
-
-                cmt_decode_opentelemetry_destroy(&decoded_context_list);
-            }
-        }
-
-        cmt_encode_opentelemetry_destroy(opentelemetry_context);
-        cmt_encode_prometheus_destroy(reference_prometheus_context);
+    payload_size = prometheus__write_request__get_packed_size(&request);
+    packed_payload = calloc(1, payload_size);
+    if (packed_payload == NULL) {
+        return NULL;
     }
 
-    cmt_destroy(cmt);
+    prometheus__write_request__pack(&request, packed_payload);
+    payload = cfl_sds_create_len((char *) packed_payload, payload_size);
+    free(packed_payload);
+
+    return payload;
 }
+
+static cfl_sds_t generate_remote_write_out_of_order_metadata_payload()
+{
+    Prometheus__WriteRequest request;
+    Prometheus__MetricMetadata metadata;
+    Prometheus__TimeSeries gauge_series;
+    Prometheus__TimeSeries counter_series;
+    Prometheus__Label gauge_name_label;
+    Prometheus__Label counter_name_label;
+    Prometheus__Sample gauge_sample;
+    Prometheus__Sample counter_sample;
+    Prometheus__MetricMetadata *metadata_list[1];
+    Prometheus__TimeSeries *time_series_list[2];
+    Prometheus__Label *gauge_label_list[1];
+    Prometheus__Label *counter_label_list[1];
+    Prometheus__Sample *gauge_sample_list[1];
+    Prometheus__Sample *counter_sample_list[1];
+    size_t payload_size;
+    unsigned char *packed_payload;
+    cfl_sds_t payload;
+
+    prometheus__write_request__init(&request);
+    prometheus__metric_metadata__init(&metadata);
+    prometheus__time_series__init(&gauge_series);
+    prometheus__time_series__init(&counter_series);
+    prometheus__label__init(&gauge_name_label);
+    prometheus__label__init(&counter_name_label);
+    prometheus__sample__init(&gauge_sample);
+    prometheus__sample__init(&counter_sample);
+
+    metadata.type = PROMETHEUS__METRIC_METADATA__METRIC_TYPE__COUNTER;
+    metadata.metric_family_name = "rw_counter";
+    metadata.help = "remote write counter";
+    metadata_list[0] = &metadata;
+    request.n_metadata = 1;
+    request.metadata = metadata_list;
+
+    gauge_name_label.name = "__name__";
+    gauge_name_label.value = "rw_gauge";
+    gauge_label_list[0] = &gauge_name_label;
+    gauge_series.n_labels = 1;
+    gauge_series.labels = gauge_label_list;
+    gauge_sample.value = 1.0;
+    gauge_sample.timestamp = 123;
+    gauge_sample_list[0] = &gauge_sample;
+    gauge_series.n_samples = 1;
+    gauge_series.samples = gauge_sample_list;
+
+    counter_name_label.name = "__name__";
+    counter_name_label.value = "rw_counter";
+    counter_label_list[0] = &counter_name_label;
+    counter_series.n_labels = 1;
+    counter_series.labels = counter_label_list;
+    counter_sample.value = 2.0;
+    counter_sample.timestamp = 124;
+    counter_sample_list[0] = &counter_sample;
+    counter_series.n_samples = 1;
+    counter_series.samples = counter_sample_list;
+
+    time_series_list[0] = &gauge_series;
+    time_series_list[1] = &counter_series;
+    request.n_timeseries = 2;
+    request.timeseries = time_series_list;
+
+    payload_size = prometheus__write_request__get_packed_size(&request);
+    packed_payload = calloc(1, payload_size);
+    if (packed_payload == NULL) {
+        return NULL;
+    }
+
+    prometheus__write_request__pack(&request, packed_payload);
+    payload = cfl_sds_create_len((char *) packed_payload, payload_size);
+    free(packed_payload);
+
+    return payload;
+}
+
+static cfl_sds_t generate_remote_write_sparse_metadata_histogram_payload()
+{
+    Prometheus__WriteRequest request;
+    Prometheus__MetricMetadata metadata;
+    Prometheus__TimeSeries gauge_series;
+    Prometheus__TimeSeries histogram_series;
+    Prometheus__Label gauge_name_label;
+    Prometheus__Label histogram_name_label;
+    Prometheus__Sample sample;
+    Prometheus__Histogram histogram;
+    Prometheus__BucketSpan span;
+    Prometheus__MetricMetadata *metadata_list[1];
+    Prometheus__TimeSeries *time_series_list[2];
+    Prometheus__Label *gauge_label_list[1];
+    Prometheus__Label *histogram_label_list[1];
+    Prometheus__Sample *sample_list[1];
+    Prometheus__Histogram *histogram_list[1];
+    Prometheus__BucketSpan *span_list[1];
+    double positive_counts[3] = {1.0, 2.0, 3.0};
+    size_t payload_size;
+    unsigned char *packed_payload;
+    cfl_sds_t payload;
+
+    prometheus__write_request__init(&request);
+    prometheus__metric_metadata__init(&metadata);
+    prometheus__time_series__init(&gauge_series);
+    prometheus__time_series__init(&histogram_series);
+    prometheus__label__init(&gauge_name_label);
+    prometheus__label__init(&histogram_name_label);
+    prometheus__sample__init(&sample);
+    prometheus__histogram__init(&histogram);
+    prometheus__bucket_span__init(&span);
+
+    metadata.type = PROMETHEUS__METRIC_METADATA__METRIC_TYPE__GAUGE;
+    metadata.metric_family_name = "rw_gauge";
+    metadata.help = "remote write gauge";
+    metadata_list[0] = &metadata;
+    request.n_metadata = 1;
+    request.metadata = metadata_list;
+
+    gauge_name_label.name = "__name__";
+    gauge_name_label.value = "rw_gauge";
+    gauge_label_list[0] = &gauge_name_label;
+    gauge_series.n_labels = 1;
+    gauge_series.labels = gauge_label_list;
+
+    sample.value = 1.0;
+    sample.timestamp = 123;
+    sample_list[0] = &sample;
+    gauge_series.n_samples = 1;
+    gauge_series.samples = sample_list;
+
+    histogram_name_label.name = "__name__";
+    histogram_name_label.value = "rw_native_hist";
+    histogram_label_list[0] = &histogram_name_label;
+    histogram_series.n_labels = 1;
+    histogram_series.labels = histogram_label_list;
+
+    span.offset = 1;
+    span.length = 3;
+    span_list[0] = &span;
+    histogram.n_positive_spans = 1;
+    histogram.positive_spans = span_list;
+    histogram.n_positive_counts = 3;
+    histogram.positive_counts = positive_counts;
+    histogram.sum = 6.0;
+    histogram.timestamp = 456;
+    histogram.count_case = PROMETHEUS__HISTOGRAM__COUNT_COUNT_INT;
+    histogram.count_int = 6;
+
+    histogram_list[0] = &histogram;
+    histogram_series.n_histograms = 1;
+    histogram_series.histograms = histogram_list;
+
+    time_series_list[0] = &gauge_series;
+    time_series_list[1] = &histogram_series;
+    request.n_timeseries = 2;
+    request.timeseries = time_series_list;
+
+    payload_size = prometheus__write_request__get_packed_size(&request);
+    packed_payload = calloc(1, payload_size);
+    if (packed_payload == NULL) {
+        return NULL;
+    }
+
+    prometheus__write_request__pack(&request, packed_payload);
+    payload = cfl_sds_create_len((char *) packed_payload, payload_size);
+    free(packed_payload);
+
+    return payload;
+}
+
 
 void test_prometheus_remote_write()
 {
     int ret;
-    struct cmt *decoded_context;
+    struct cmt *decoded_context = NULL;
     cfl_sds_t payload = read_file(CMT_TESTS_DATA_PATH "/remote_write_dump_originally_from_node_exporter.bin");
 
     cmt_initialize();
@@ -193,9 +264,164 @@ void test_prometheus_remote_write()
     ret = cmt_decode_prometheus_remote_write_create(&decoded_context, payload, cfl_sds_len(payload));
     TEST_CHECK(ret == CMT_DECODE_PROMETHEUS_REMOTE_WRITE_SUCCESS);
 
-    cmt_decode_prometheus_remote_write_destroy(decoded_context);
+    if (decoded_context != NULL) {
+        cmt_decode_prometheus_remote_write_destroy(decoded_context);
+        decoded_context = NULL;
+    }
 
     cfl_sds_destroy(payload);
+}
+
+void test_prometheus_remote_write_missing_label_name_rejected()
+{
+    int ret;
+    struct cmt *decoded_context = NULL;
+    cfl_sds_t payload;
+
+    cmt_initialize();
+
+    payload = generate_remote_write_payload(NULL, "value");
+    TEST_CHECK(payload != NULL);
+    if (payload != NULL) {
+        ret = cmt_decode_prometheus_remote_write_create(&decoded_context,
+                                                        payload,
+                                                        cfl_sds_len(payload));
+        TEST_CHECK(ret != CMT_DECODE_PROMETHEUS_REMOTE_WRITE_SUCCESS);
+        if (decoded_context != NULL) {
+            cmt_decode_prometheus_remote_write_destroy(decoded_context);
+            decoded_context = NULL;
+        }
+        cfl_sds_destroy(payload);
+    }
+}
+
+void test_prometheus_remote_write_missing_label_value_no_crash()
+{
+    int ret;
+    struct cmt *decoded_context = NULL;
+    cfl_sds_t payload;
+    cfl_sds_t encoded_payload;
+
+    cmt_initialize();
+
+    payload = generate_remote_write_payload("zone", NULL);
+    TEST_CHECK(payload != NULL);
+    if (payload != NULL) {
+        ret = cmt_decode_prometheus_remote_write_create(&decoded_context,
+                                                        payload,
+                                                        cfl_sds_len(payload));
+        TEST_CHECK(ret == CMT_DECODE_PROMETHEUS_REMOTE_WRITE_SUCCESS);
+        if (ret == CMT_DECODE_PROMETHEUS_REMOTE_WRITE_SUCCESS) {
+            encoded_payload = cmt_encode_prometheus_remote_write_create(decoded_context);
+            TEST_CHECK(encoded_payload != NULL);
+            if (encoded_payload != NULL) {
+                cmt_encode_prometheus_remote_write_destroy(encoded_payload);
+            }
+        }
+        if (decoded_context != NULL) {
+            cmt_decode_prometheus_remote_write_destroy(decoded_context);
+            decoded_context = NULL;
+        }
+        cfl_sds_destroy(payload);
+    }
+}
+
+void test_prometheus_remote_write_sparse_metadata_histogram()
+{
+    int ret;
+    struct cmt_metric *metric;
+    struct cmt_histogram *histogram;
+    struct cmt *decoded_context = NULL;
+    cfl_sds_t payload;
+
+    cmt_initialize();
+
+    payload = generate_remote_write_sparse_metadata_histogram_payload();
+    TEST_CHECK(payload != NULL);
+    if (payload != NULL) {
+        ret = cmt_decode_prometheus_remote_write_create(&decoded_context,
+                                                        payload,
+                                                        cfl_sds_len(payload));
+        TEST_CHECK(ret == CMT_DECODE_PROMETHEUS_REMOTE_WRITE_SUCCESS);
+        if (ret == CMT_DECODE_PROMETHEUS_REMOTE_WRITE_SUCCESS) {
+            TEST_CHECK(cfl_list_size(&decoded_context->gauges) == 1);
+            TEST_CHECK(cfl_list_size(&decoded_context->histograms) == 1);
+
+            histogram = cfl_list_entry_first(&decoded_context->histograms,
+                                             struct cmt_histogram, _head);
+            TEST_CHECK(histogram != NULL);
+            if (histogram != NULL) {
+                TEST_CHECK(histogram->buckets != NULL);
+                if (histogram->buckets != NULL) {
+                    TEST_CHECK(histogram->buckets->count == 3);
+                    TEST_CHECK(histogram->buckets->upper_bounds[0] == 1.0);
+                    TEST_CHECK(histogram->buckets->upper_bounds[1] == 2.0);
+                    TEST_CHECK(histogram->buckets->upper_bounds[2] == 3.0);
+                }
+
+                TEST_CHECK(cfl_list_size(&histogram->map->metrics) == 1);
+                metric = cfl_list_entry_first(&histogram->map->metrics,
+                                              struct cmt_metric, _head);
+                TEST_CHECK(metric != NULL);
+                if (metric != NULL) {
+                    TEST_CHECK(metric->hist_buckets != NULL);
+                    if (metric->hist_buckets != NULL) {
+                        TEST_CHECK(cmt_metric_hist_get_value(metric, 0) == 1);
+                        TEST_CHECK(cmt_metric_hist_get_value(metric, 1) == 2);
+                        TEST_CHECK(cmt_metric_hist_get_value(metric, 2) == 3);
+                    }
+                    TEST_CHECK(cmt_metric_hist_get_count_value(metric) == 6);
+                }
+            }
+        }
+        if (decoded_context != NULL) {
+            cmt_decode_prometheus_remote_write_destroy(decoded_context);
+            decoded_context = NULL;
+        }
+        cfl_sds_destroy(payload);
+    }
+}
+
+void test_prometheus_remote_write_metadata_matched_by_name()
+{
+    int ret;
+    struct cmt *decoded_context = NULL;
+    struct cmt_counter *counter;
+    struct cmt_gauge *gauge;
+    cfl_sds_t payload;
+
+    cmt_initialize();
+
+    payload = generate_remote_write_out_of_order_metadata_payload();
+    TEST_CHECK(payload != NULL);
+    if (payload != NULL) {
+        ret = cmt_decode_prometheus_remote_write_create(&decoded_context,
+                                                        payload,
+                                                        cfl_sds_len(payload));
+        TEST_CHECK(ret == CMT_DECODE_PROMETHEUS_REMOTE_WRITE_SUCCESS);
+        if (ret == CMT_DECODE_PROMETHEUS_REMOTE_WRITE_SUCCESS) {
+            TEST_CHECK(cfl_list_size(&decoded_context->gauges) == 1);
+            TEST_CHECK(cfl_list_size(&decoded_context->counters) == 1);
+
+            gauge = cfl_list_entry_first(&decoded_context->gauges,
+                                         struct cmt_gauge, _head);
+            counter = cfl_list_entry_first(&decoded_context->counters,
+                                           struct cmt_counter, _head);
+            TEST_CHECK(gauge != NULL);
+            TEST_CHECK(counter != NULL);
+            if (gauge != NULL) {
+                TEST_CHECK(strcmp(gauge->opts.name, "rw_gauge") == 0);
+            }
+            if (counter != NULL) {
+                TEST_CHECK(strcmp(counter->opts.name, "rw_counter") == 0);
+            }
+        }
+        if (decoded_context != NULL) {
+            cmt_decode_prometheus_remote_write_destroy(decoded_context);
+            decoded_context = NULL;
+        }
+        cfl_sds_destroy(payload);
+    }
 }
 
 void test_statsd()
@@ -230,8 +456,11 @@ void test_statsd()
 
 
 TEST_LIST = {
-    {"opentelemetry", test_opentelemetry},
     {"prometheus_remote_write", test_prometheus_remote_write},
+    {"prometheus_remote_write_missing_label_name_rejected", test_prometheus_remote_write_missing_label_name_rejected},
+    {"prometheus_remote_write_missing_label_value_no_crash", test_prometheus_remote_write_missing_label_value_no_crash},
+    {"prometheus_remote_write_sparse_metadata_histogram", test_prometheus_remote_write_sparse_metadata_histogram},
+    {"prometheus_remote_write_metadata_matched_by_name", test_prometheus_remote_write_metadata_matched_by_name},
     {"statsd", test_statsd},
     { 0 }
 };

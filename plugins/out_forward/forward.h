@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -134,10 +134,16 @@ struct flb_forward_ping {
     int keepalive;
 };
 
+/*
+ * Maximum storage required for a 'chunk' ack token: Base64 representation
+ * of a 128 bits unique id (24 bytes) plus NUL terminator.
+ */
+#define FLB_FORWARD_CHUNK_TOKEN_SIZE   25
+
 /* Flush callback context */
 struct flb_forward_flush {
     struct flb_forward_config *fc;
-    char checksum_hex[33];
+    char chunk_token[FLB_FORWARD_CHUNK_TOKEN_SIZE];
 };
 
 struct flb_forward_config *flb_forward_target(struct flb_forward *ctx,

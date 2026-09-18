@@ -4,37 +4,67 @@ This document outlines the maintenance strategy and version support for Fluent B
 
 ## Active Branches and Maintainers
 
-| Branch     | Version            | Status              | Maintainer                                                  | Notes                                                              |
-|------------|--------------------|---------------------|-------------------------------------------------------------|--------------------------------------------------------------------|
-| `master`   | v4.1 (development) | Active development  | [Eduardo Silva](https://github.com/edsiper)                 | All new features and bug fixes land here first                     |
-| `4.0`      | v4.0.x             | Maintenance only    | [Hiroshi Hatake (@cosmo0920)](https://github.com/cosmo0920) | Critical fixes and safe backports only. Maintained until **Dec 31, 2025** |
+| Branch     | Version | Status           | Maintainer                                                  | Notes                                                              |
+|------------|---------|------------------|-------------------------------------------------------------|--------------------------------------------------------------------|
+| `master`   | v5.1.x  | Stable           | [Eduardo Silva](https://github.com/edsiper)                 | Current stable release series. All new features and bug fixes land here first. |
+| `5.0`      | v5.0.x  | Maintenance only | [Eduardo Silva](https://github.com/edsiper) [Hiroshi Hatake (@cosmo0920)](https://github.com/cosmo0920) | Critical bug fixes, security fixes, and selected low-risk backports until **November 30, 2026**. |
 
 ---
 
-## v4.0 Maintenance Policy
+## Maintenance Policy
 
-As of **July 2025**, active development has moved to Fluent Bit **v4.1** (tracked in the `master` branch).
+Fluent Bit **v5.1** is the current stable release series and is tracked in the
+`master` branch. The **v5.0** branch is in maintenance mode and receives bug
+fixes, security updates, and selected low-risk backports until its
+End-of-Maintenance date. Older release lines are End-of-Life (EOL).
 
-**v4.0** has entered **maintenance mode**, now maintained by [Hiroshi Hatake (@cosmo0920)](https://github.com/cosmo0920), a long-time Fluent Bit contributor and core developer.
+### Accepted Changes for Maintenance Branches
 
-Maintenance for v4.0 will continue until **December 31, 2025**, which is three months after the official v4.1 release.
-
-### Accepted Changes for v4.0
-
-- ✅ Security patches
+- ✅ Security patches (see [SECURITY.md](SECURITY.md) for security update timelines)
 - ✅ Critical bug fixes
 - ✅ Low-risk enhancements that unblock adoption (e.g., OpenTelemetry improvements, performance tuning)
 
-> ⚠️ All changes must first be merged into `master` before being cherry-picked into the `4.0` branch by the maintainer.
+> ⚠️ All changes must first be merged into `master` before being cherry-picked into maintenance branches by the maintainer.
 
-v4.0 releases will continue on an as-needed basis depending on urgency and impact.
+Maintenance releases continue on an as-needed basis depending on urgency and impact.
+
+### v5.1 Stable Series
+
+**v5.1** is the current stable release series and is recommended for production
+use. New features and bug fixes land in `master` first.
+
+### v5.0 Maintenance
+
+**v5.0** is in **maintenance mode** and receives critical bug fixes, security
+updates, and selected low-risk backports until **November 30, 2026** (as
+specified in [SECURITY.md](SECURITY.md)).
+
+### v4.2 End-of-Life
+
+**v4.2** reached **End-of-Life (EOL)** on **July 30, 2026** and is no longer
+maintained.
+
+### v4.1 End-of-Life
+
+**v4.1** reached **End-of-Life (EOL)** on **February 28, 2026** and is no longer
+maintained.
+
+### v4.0 End-of-Life
+
+**v4.0** reached **End-of-Life (EOL)** on **December 23, 2025** and is no longer maintained. No further security patches or bug fixes will be provided for this version line.
 
 ---
 
 ## How to Contribute to Maintained Versions
 
-If you're submitting a fix or feature relevant to v4.0:
+If you're submitting a fix or feature relevant to a stable or maintenance
+branch:
 
 - Open your PR against the `master` branch
-- Add a note in the PR or issue: `Target: v4.0`
-- Tag [@cosmo0920](https://github.com/cosmo0920) to request backport consideration
+- For a v5.0 backport, add `Target: v5.0` to the PR or issue and tag
+  [@edsiper](https://github.com/edsiper) or
+  [@cosmo0920](https://github.com/cosmo0920)
+
+> **Note:** v4.2 and earlier are End-of-Life and no longer accept backports. For
+> security-related issues, follow the process outlined in
+> [SECURITY.md](SECURITY.md).

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,18 +28,39 @@
 int ne_utils_str_to_double(char *str, double *out_val);
 int ne_utils_str_to_uint64(char *str, uint64_t *out_val);
 
-int ne_utils_file_read_uint64(const char *mount,
+int ne_utils_file_read_uint64(struct flb_ne *ctx,
+                              const char *mount,
                               const char *path,
                               const char *join_a, const char *join_b,
                               uint64_t *out_val);
 
-int ne_utils_file_read_sds(const char *mount,
+int ne_utils_file_read_uint64_at_level(struct flb_ne *ctx,
+                                       const char *mount,
+                                       const char *path,
+                                       const char *join_a,
+                                       const char *join_b,
+                                       uint64_t *out_val,
+                                       int log_level);
+
+int ne_utils_file_read_sds(struct flb_ne *ctx,
+                           const char *mount,
                            const char *path,
                            const char *join_a,
                            const char *join_b,
                            flb_sds_t *str);
 
-int ne_utils_file_read_lines(const char *mount, const char *path, struct mk_list *list);
+int ne_utils_file_read_sds_at_level(struct flb_ne *ctx,
+                                    const char *mount,
+                                    const char *path,
+                                    const char *join_a,
+                                    const char *join_b,
+                                    flb_sds_t *str,
+                                    int log_level);
+
+int ne_utils_file_read_lines(struct flb_ne *ctx,
+                             const char *mount,
+                             const char *path,
+                             struct mk_list *list);
 int ne_utils_path_scan(struct flb_ne *ctx, const char *mount, const char *path,
                        int expected, struct mk_list *list);
 #endif

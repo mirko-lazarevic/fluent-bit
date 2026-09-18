@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include <fluent-bit/flb_scheduler.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_http_server.h>
+#include <inttypes.h>
 
 static struct cmt *metrics_context_create(struct flb_storage_metrics *sm)
 {
@@ -390,30 +391,60 @@ struct flb_storage_metrics *flb_storage_metrics_create(struct flb_config *ctx)
     return sm;
 }
 
+static int parse_stamp(const char *p, time_t *sec, long *nsec)
+{
+    uint64_t s = 0, ns = 0;
+
+    if (!p || !sec || !nsec) {
+        return -1;
+    }
+    /* expected: "1234567890.123456789.flb" format */
+    if (sscanf(p, "%" SCNu64 ".%" SCNu64 ".flb", &s, &ns) != 2) {
+        return -1;
+    }
+    if (ns >= 1000000000ULL) {
+        return -1;
+    }
+
+    *sec  = (time_t)s;
+    *nsec = (long)ns;
+    return 0;
+}
+
 static int sort_chunk_cmp(const void *a_arg, const void *b_arg)
 {
-    char *p;
     struct cio_chunk *chunk_a = *(struct cio_chunk **) a_arg;
     struct cio_chunk *chunk_b = *(struct cio_chunk **) b_arg;
-    struct timespec tm_a;
-    struct timespec tm_b;
+    const char *pa, *pb;
+    int ra = 0;
+    int rb = 0;
+    struct timespec tm_a = {0}, tm_b = {0};
 
     /* Scan Chunk A */
-    p = strchr(chunk_a->name, '-');
-    if (!p) {
-        return -1;
+    pa = strrchr(chunk_a->name, '-');
+    if (pa && parse_stamp(pa + 1, &tm_a.tv_sec, &tm_a.tv_nsec) == 0) {
+        ra = -1;
     }
-    p++;
-
-    sscanf(p, "%lu.%lu.flb", &tm_a.tv_sec, &tm_a.tv_nsec);
 
     /* Scan Chunk B */
-    p = strchr(chunk_b->name, '-');
-    if (!p) {
-        return -1;
+    pb = strrchr(chunk_b->name, '-');
+    if (pb && parse_stamp(pb + 1, &tm_b.tv_sec, &tm_b.tv_nsec) == 0) {
+        rb = -1;
     }
-    p++;
-    sscanf(p, "%lu.%lu.flb", &tm_b.tv_sec, &tm_b.tv_nsec);
+
+    /* Ensure strict ordering in presence of invalid names */
+    if (ra != 0 || rb != 0) {
+        /* valid < invalid */
+        if (ra == 0 && rb != 0) {
+            return -1;
+        }
+        /* invalid > valid */
+        if (ra != 0 && rb == 0) {
+            return 1;
+        }
+        /* both invalid: deterministic fallback */
+        return strcmp(chunk_a->name, chunk_b->name);
+    }
 
     /* Compare */
     if (tm_a.tv_sec != tm_b.tv_sec) {
@@ -745,6 +776,206 @@ void flb_storage_chunk_count(struct flb_config *ctx, int *mem_chunks, int *fs_ch
 
     *mem_chunks = storage_st.chunks_mem;
     *fs_chunks = storage_st.chunks_fs;
+}
+
+/* Replace '/', '\\' and ':' with '_' to make filename components safe */
+static inline void sanitize_name_component(const char *in, char *out, size_t out_sz)
+{
+    size_t i;
+
+    if (out_sz == 0) {
+        return;
+    }
+
+    if (!in) {
+        in = "no-tag";
+    }
+
+    for (i = 0; i < out_sz - 1 && in[i] != '\0'; i++) {
+        out[i] = (in[i] == '/' || in[i] == '\\' || in[i] == ':') ? '_' : in[i];
+    }
+    out[i] = '\0';
+}
+
+static struct cio_stream *get_or_create_rejected_stream(struct flb_config *ctx)
+{
+#ifdef CIO_HAVE_BACKEND_FILESYSTEM
+    struct cio_stream *st;
+    const char *name;
+
+    if (!ctx || !ctx->cio) {
+        return NULL;
+    }
+    if (!ctx->storage_keep_rejected || !ctx->storage_path) {
+        return NULL;
+    }
+
+    if (ctx->storage_rejected_stream) {
+        return ctx->storage_rejected_stream;
+    }
+
+    name = ctx->storage_rejected_path ? ctx->storage_rejected_path : "rejected";
+
+    st = cio_stream_get(ctx->cio, name);
+    if (!st) {
+        st = cio_stream_create(ctx->cio, name, FLB_STORAGE_FS);
+    }
+    if (!st) {
+        flb_warn("[storage] failed to create rejected stream '%s'", name);
+        return NULL;
+    }
+
+    ctx->storage_rejected_stream = st;
+    return st;
+#else
+    FLB_UNUSED(ctx);
+    return NULL;
+#endif
+}
+
+static inline int flb_storage_chunk_restore_state(struct cio_chunk *src, int was_up, int ret_val)
+{
+    if (!was_up) {
+        if (cio_chunk_down(src) != CIO_OK) {
+            flb_debug("[storage] failed to bring chunk back down");
+        }
+    }
+
+    return ret_val;
+}
+
+static ssize_t dlq_stream_total_size(struct cio_stream *st)
+{
+    ssize_t chunk_size;
+    ssize_t total = 0;
+    struct cio_chunk *ch;
+    struct mk_list *head;
+
+    mk_list_foreach(head, &st->chunks) {
+        ch = mk_list_entry(head, struct cio_chunk, _head);
+
+        /* Total content bytes, to match write-path size checks */
+        chunk_size = cio_chunk_get_content_size(ch);
+        if (chunk_size > 0) {
+            total += chunk_size;
+        }
+    }
+
+    return total;
+}
+
+int flb_storage_quarantine_chunk(struct flb_config *ctx,
+                                 struct cio_chunk *src,
+                                 const char *tag,
+                                 int status_code,
+                                 const char *out_name)
+{
+#ifdef CIO_HAVE_BACKEND_FILESYSTEM
+    struct cio_stream *dlq;
+    void   *buf = NULL;
+    int     was_up = 0;
+    size_t  size = 0;
+    int     err = 0;
+    char    name[256];
+    struct cio_chunk *dst;
+    char safe_tag[128];
+    char safe_out[64];
+    ssize_t current_size;
+    ssize_t next_size;
+    int64_t max_size;
+
+    if (!ctx || !src) {
+        return -1;
+    }
+    dlq = get_or_create_rejected_stream(ctx);
+    if (!dlq) {
+        return -1;
+    }
+
+    if (ctx->storage_rejected_limit) {
+        max_size = flb_utils_size_to_bytes(ctx->storage_rejected_limit);
+        if (max_size <= 0) {
+            flb_warn("[storage] invalid DLQ size limit '%s'",
+                     ctx->storage_rejected_limit);
+            return -1;
+        }
+
+        current_size = dlq_stream_total_size(dlq);
+        if (current_size >= max_size) {
+            flb_warn("[storage] DLQ size limit reached (%zd/%" PRId64 " bytes), "
+                     "rejected chunk copy skipped", current_size, max_size);
+            return -1;
+        }
+    }
+
+    /* Remember original state and bring the chunk up if needed */
+    was_up = (cio_chunk_is_up(src) == CIO_TRUE);
+    if (!was_up) {
+        if (cio_chunk_up_force(src) != CIO_OK) {
+            flb_warn("[storage] cannot bring chunk up to copy into DLQ");
+            return -1;
+        }
+    }
+
+    sanitize_name_component(tag, safe_tag, sizeof(safe_tag));
+    sanitize_name_component(out_name ? out_name : "out", safe_out, sizeof(safe_out));
+
+    /* Compose a simple, unique-ish file name with sanitized pieces */
+    snprintf(name, sizeof(name),
+             "%s_%d_%s_%p.flb",
+             safe_tag, status_code, safe_out, (void *) src);
+
+    if (cio_chunk_get_content_copy(src, &buf, &size) != CIO_OK || size == 0) {
+        flb_warn("[storage] cannot read content for DLQ copy (size=%zu)", size);
+        return flb_storage_chunk_restore_state(src, was_up, -1);
+    }
+
+    if (ctx->storage_rejected_limit && current_size + (ssize_t) size > max_size) {
+        flb_warn("[storage] DLQ size limit exceeded (%zd + %zu > %" PRId64
+                 " bytes), rejected chunk copy skipped",
+                 current_size, size, max_size);
+        flb_free(buf);
+        return flb_storage_chunk_restore_state(src, was_up, -1);
+    }
+
+    if (ctx->storage_rejected_limit) {
+        next_size = current_size + (ssize_t) size;
+        if (next_size >= (max_size * 9) / 10) {
+            flb_warn("[storage] DLQ content size is at %zd/%" PRId64
+                     " bytes (>=90%% of limit)", next_size, max_size);
+        }
+    }
+
+    /* Create + write the DLQ copy */
+    dst = cio_chunk_open(ctx->cio, dlq, name, CIO_OPEN, size, &err);
+    if (!dst) {
+        flb_warn("[storage] DLQ open failed (err=%d)", err);
+        flb_free(buf);
+        return flb_storage_chunk_restore_state(src, was_up, -1);
+    }
+    if (cio_chunk_write(dst, buf, size) != CIO_OK ||
+        cio_chunk_sync(dst) != CIO_OK) {
+        flb_warn("[storage] DLQ write/sync failed");
+        cio_chunk_close(dst, CIO_TRUE);
+        flb_free(buf);
+        return flb_storage_chunk_restore_state(src, was_up, -1);
+    }
+
+    cio_chunk_close(dst, CIO_FALSE);
+    flb_free(buf);
+
+    flb_info("[storage] quarantined rejected chunk into DLQ stream (bytes=%zu)", size);
+
+    return flb_storage_chunk_restore_state(src, was_up, 0);
+#else
+    FLB_UNUSED(ctx);
+    FLB_UNUSED(src);
+    FLB_UNUSED(tag);
+    FLB_UNUSED(status_code);
+    FLB_UNUSED(out_name);
+
+    return -1;
+#endif
 }
 
 void flb_storage_destroy(struct flb_config *ctx)

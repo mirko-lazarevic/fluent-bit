@@ -47,6 +47,44 @@ int cmt_mpack_consume_double_tag(mpack_reader_t *reader, double *output_buffer)
     return CMT_MPACK_SUCCESS;
 }
 
+int cmt_mpack_consume_int_tag(mpack_reader_t *reader, int64_t *output_buffer)
+{
+    uint64_t unsigned_value;
+    mpack_tag_t tag;
+
+    if (NULL == output_buffer) {
+        return CMT_MPACK_INVALID_ARGUMENT_ERROR;
+    }
+
+    if (NULL == reader) {
+        return CMT_MPACK_INVALID_ARGUMENT_ERROR;
+    }
+
+    tag = mpack_read_tag(reader);
+
+    if (mpack_ok != mpack_reader_error(reader)) {
+        return CMT_MPACK_ENGINE_ERROR;
+    }
+
+    if (mpack_type_int == mpack_tag_type(&tag)) {
+        *output_buffer = mpack_tag_int_value(&tag);
+    }
+    else if (mpack_type_uint == mpack_tag_type(&tag)) {
+        unsigned_value = mpack_tag_uint_value(&tag);
+
+        if (unsigned_value > INT64_MAX) {
+            return CMT_MPACK_UNEXPECTED_DATA_TYPE_ERROR;
+        }
+
+        *output_buffer = (int64_t) unsigned_value;
+    }
+    else {
+        return CMT_MPACK_UNEXPECTED_DATA_TYPE_ERROR;
+    }
+
+    return CMT_MPACK_SUCCESS;
+}
+
 int cmt_mpack_consume_uint_tag(mpack_reader_t *reader, uint64_t *output_buffer)
 {
     mpack_tag_t tag;
@@ -76,6 +114,7 @@ int cmt_mpack_consume_uint_tag(mpack_reader_t *reader, uint64_t *output_buffer)
 
 int cmt_mpack_consume_string_tag(mpack_reader_t *reader, cfl_sds_t *output_buffer)
 {
+    const char  *string_data;
     uint32_t    string_length;
     mpack_tag_t tag;
 
@@ -99,42 +138,38 @@ int cmt_mpack_consume_string_tag(mpack_reader_t *reader, cfl_sds_t *output_buffe
 
     string_length = mpack_tag_str_length(&tag);
 
-    /* This validation only applies to cmetrics and its use cases, we know
-     * for a fact that our label names and values are not supposed to be really
-     * long so a huge value here probably means that the data stream got corrupted.
-     */
-
-    if (CMT_MPACK_MAX_STRING_LENGTH < string_length) {
-        return CMT_MPACK_CORRUPT_INPUT_DATA_ERROR;
-    }
-
-    *output_buffer = cfl_sds_create_size(string_length + 1);
-
-    if (NULL == *output_buffer) {
-        return CMT_MPACK_ALLOCATION_ERROR;
-    }
-
-    cfl_sds_set_len(*output_buffer, string_length);
-
-    mpack_read_cstr(reader, *output_buffer, string_length + 1, string_length);
+    /* Validate that the complete string is present before allocating memory
+     * based on its untrusted length field. The data-backed reader used by the
+     * decoder can return the bytes in place without an intermediate copy. */
+    string_data = mpack_read_bytes_inplace(reader, (size_t) string_length);
 
     if (mpack_ok != mpack_reader_error(reader)) {
-        cfl_sds_destroy(*output_buffer);
-
-        *output_buffer = NULL;
-
         return CMT_MPACK_ENGINE_ERROR;
     }
 
     mpack_done_str(reader);
 
     if (mpack_ok != mpack_reader_error(reader)) {
-        cfl_sds_destroy(*output_buffer);
-
-        *output_buffer = NULL;
-
         return CMT_MPACK_ENGINE_ERROR;
     }
+
+    /* CMetrics strings are represented as C strings. Preserve the existing
+     * rejection of embedded NUL bytes while allowing arbitrary valid lengths. */
+    if (NULL != memchr(string_data, '\0', (size_t) string_length)) {
+        return CMT_MPACK_CORRUPT_INPUT_DATA_ERROR;
+    }
+
+    *output_buffer = cfl_sds_create_size((size_t) string_length);
+
+    if (NULL == *output_buffer) {
+        return CMT_MPACK_ALLOCATION_ERROR;
+    }
+
+    if (string_length > 0) {
+        memcpy(*output_buffer, string_data, (size_t) string_length);
+    }
+
+    cfl_sds_set_len(*output_buffer, (size_t) string_length);
 
     return CMT_MPACK_SUCCESS;
 }

@@ -27,8 +27,24 @@
 
 // #include "../../plugins/in_opentelemetry/opentelemetry.h"
 #include <fluent-bit/flb_opentelemetry.h>
+#include <ctraces/ctraces.h>
+#include <cmetrics/cmetrics.h>
+#include <cmetrics/cmt_counter.h>
+#include <cmetrics/cmt_decode_opentelemetry.h>
+#include <cmetrics/cmt_encode_opentelemetry.h>
+#include <cmetrics/cmt_encode_msgpack.h>
+#include <cmetrics/cmt_exp_histogram.h>
+#include <cmetrics/cmt_gauge.h>
+#include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_map.h>
+#include <cmetrics/cmt_metric.h>
+#include <cmetrics/cmt_summary.h>
+#include <ctraces/ctr_encode_msgpack.h>
+#include <ctraces/ctr_encode_opentelemetry.h>
+#include <fluent-otel-proto/fluent-otel.h>
 #include <msgpack.h>
 #include <string.h>
+#include <fluent-bit/flb_json.h>
 
 #include "flb_tests_internal.h"
 
@@ -187,8 +203,8 @@ static struct test_output *parse_test_output(void *chunk, size_t size)
         if (record_type == FLB_LOG_EVENT_GROUP_START) {
             /* Group header */
             if (group_idx < output->group_count) {
-                output->groups[group_idx].metadata = flb_msgpack_to_json_str(1024, event.metadata);
-                output->groups[group_idx].body = flb_msgpack_to_json_str(1024, event.body);
+                output->groups[group_idx].metadata = flb_msgpack_to_json_str(1024, event.metadata, FLB_TRUE);
+                output->groups[group_idx].body = flb_msgpack_to_json_str(1024, event.body, FLB_TRUE);
 
                 /* Allocate records for this group */
                 if (output->groups[group_idx].record_count > 0) {
@@ -209,8 +225,8 @@ static struct test_output *parse_test_output(void *chunk, size_t size)
             /* Log record within a group */
             if (group_idx < output->group_count &&
                 record_idx < output->groups[group_idx].record_count) {
-                output->groups[group_idx].records[record_idx].metadata = flb_msgpack_to_json_str(1024, event.metadata);
-                output->groups[group_idx].records[record_idx].body = flb_msgpack_to_json_str(1024, event.body);
+                output->groups[group_idx].records[record_idx].metadata = flb_msgpack_to_json_str(1024, event.metadata, FLB_TRUE);
+                output->groups[group_idx].records[record_idx].body = flb_msgpack_to_json_str(1024, event.body, FLB_TRUE);
                 record_idx++;
             }
         }
@@ -238,6 +254,42 @@ static char *get_group_metadata(void *chunk, size_t size)
     }
     free_test_output(output);
     return result;
+}
+
+static int json_strings_equal_allowing_otlp_timestamp(const char *expected,
+                                                      const char *actual)
+{
+    const char *prefix = "{\"otlp\":{\"timestamp\":";
+    size_t prefix_len = strlen(prefix);
+
+    if (expected == NULL || actual == NULL) {
+        return expected == actual;
+    }
+
+    if (strcmp(expected, actual) == 0) {
+        return FLB_TRUE;
+    }
+
+    if (strcmp(expected, "{\"otlp\":{}}") == 0) {
+        if (strncmp(actual, prefix, prefix_len) != 0) {
+            return FLB_FALSE;
+        }
+
+        actual += prefix_len;
+
+        while (*actual != '\0' && *actual != '}') {
+            if (*actual == ',') {
+                return FLB_FALSE;
+            }
+            actual++;
+        }
+
+        if (strcmp(actual, "}}") == 0) {
+            return FLB_TRUE;
+        }
+    }
+
+    return FLB_FALSE;
 }
 
 static char *get_group_body(void *chunk, size_t size)
@@ -308,8 +360,9 @@ static int validate_extended_output(struct test_output *actual, msgpack_object *
         /* Validate group metadata */
         ret = flb_otel_utils_find_map_entry_by_key(&group_obj->via.map, "metadata", 0, FLB_TRUE);
         if (ret >= 0) {
-            expected_meta = flb_msgpack_to_json_str(256, &group_obj->via.map.ptr[ret].val);
-            if (strcmp(expected_meta, actual->groups[i].metadata) != 0) {
+            expected_meta = flb_msgpack_to_json_str(256, &group_obj->via.map.ptr[ret].val, FLB_TRUE);
+            if (!json_strings_equal_allowing_otlp_timestamp(expected_meta,
+                                                            actual->groups[i].metadata)) {
                 printf("Group %zu metadata mismatch:\nExpected: %s\nGot: %s\n",
                        i, expected_meta, actual->groups[i].metadata);
                 flb_free(expected_meta);
@@ -321,7 +374,7 @@ static int validate_extended_output(struct test_output *actual, msgpack_object *
         /* Validate group body */
         ret = flb_otel_utils_find_map_entry_by_key(&group_obj->via.map, "body", 0, FLB_TRUE);
         if (ret >= 0) {
-            expected_body = flb_msgpack_to_json_str(256, &group_obj->via.map.ptr[ret].val);
+            expected_body = flb_msgpack_to_json_str(256, &group_obj->via.map.ptr[ret].val, FLB_TRUE);
             if (strcmp(expected_body, actual->groups[i].body) != 0) {
                 printf("Group %zu body mismatch:\nExpected: %s\nGot: %s\n",
                        i, expected_body, actual->groups[i].body);
@@ -359,8 +412,9 @@ static int validate_extended_output(struct test_output *actual, msgpack_object *
                 /* Validate record metadata */
                 ret = flb_otel_utils_find_map_entry_by_key(&record_obj->via.map, "metadata", 0, FLB_TRUE);
                 if (ret >= 0) {
-                    expected_meta = flb_msgpack_to_json_str(256, &record_obj->via.map.ptr[ret].val);
-                    if (strcmp(expected_meta, actual->groups[i].records[j].metadata) != 0) {
+                    expected_meta = flb_msgpack_to_json_str(256, &record_obj->via.map.ptr[ret].val, FLB_TRUE);
+                    if (!json_strings_equal_allowing_otlp_timestamp(expected_meta,
+                                                                    actual->groups[i].records[j].metadata)) {
                         printf("Group %zu record %zu metadata mismatch:\nExpected: %s\nGot: %s\n",
                                i, j, expected_meta, actual->groups[i].records[j].metadata);
                         flb_free(expected_meta);
@@ -372,7 +426,7 @@ static int validate_extended_output(struct test_output *actual, msgpack_object *
                 /* Validate record body */
                 ret = flb_otel_utils_find_map_entry_by_key(&record_obj->via.map, "body", 0, FLB_TRUE);
                 if (ret >= 0) {
-                    expected_body = flb_msgpack_to_json_str(256, &record_obj->via.map.ptr[ret].val);
+                    expected_body = flb_msgpack_to_json_str(256, &record_obj->via.map.ptr[ret].val, FLB_TRUE);
                     if (strcmp(expected_body, actual->groups[i].records[j].body) != 0) {
                         printf("Group %zu record %zu body mismatch:\nExpected: %s\nGot: %s\n",
                                i, j, expected_body, actual->groups[i].records[j].body);
@@ -405,6 +459,44 @@ void test_hex_to_id()
     ret = flb_otel_utils_hex_to_id((char *)hex, strlen(hex), out, sizeof(out));
     TEST_CHECK(ret == 0);
     TEST_CHECK(memcmp(out, expect, sizeof(expect)) == 0);
+}
+
+void test_hex_to_id_error_cases()
+{
+    unsigned char out[16];
+    int ret;
+
+    /* Test zero length string */
+    ret = flb_otel_utils_hex_to_id("", 0, out, 16);
+    TEST_CHECK(ret == 0); /* Zero length should succeed (empty output) */
+
+    /* Test odd length string */
+    ret = flb_otel_utils_hex_to_id("123", 3, out, 16);
+    TEST_CHECK(ret == -1); /* Odd length should fail */
+
+    /* Test invalid hex character */
+    ret = flb_otel_utils_hex_to_id("0000000000000000000000000000000G", 32, out, 16);
+    TEST_CHECK(ret == -1); /* Invalid hex character should fail */
+
+    /* Test mixed valid/invalid hex */
+    ret = flb_otel_utils_hex_to_id("0000000000000000000000000000000Z", 32, out, 16);
+    TEST_CHECK(ret == -1); /* Invalid hex character should fail */
+
+    /* Test valid hex with wrong output size */
+    ret = flb_otel_utils_hex_to_id("00000000000000000000000000000001", 32, out, 8);
+    TEST_CHECK(ret == 0); /* Should succeed even with larger output buffer */
+
+    /* Test valid hex with correct size */
+    ret = flb_otel_utils_hex_to_id("0000000000000001", 16, out, 8);
+    TEST_CHECK(ret == 0); /* Should succeed */
+
+    /* Test valid hex with uppercase */
+    ret = flb_otel_utils_hex_to_id("0000000000000000000000000000000A", 32, out, 16);
+    TEST_CHECK(ret == 0); /* Should succeed with uppercase hex */
+
+    /* Test valid hex with lowercase */
+    ret = flb_otel_utils_hex_to_id("0000000000000000000000000000000a", 32, out, 16);
+    TEST_CHECK(ret == 0); /* Should succeed with lowercase hex */
 }
 
 void test_convert_string_number_to_u64()
@@ -475,9 +567,874 @@ void test_json_payload_get_wrapped_value()
 
     msgpack_sbuffer_destroy(&sbuf);
     msgpack_unpacked_destroy(&up);
+
+    /* Test integer value provided as a string */
+    msgpack_sbuffer_init(&sbuf);
+    msgpack_packer_init(&pck, &sbuf, msgpack_sbuffer_write);
+
+    msgpack_pack_map(&pck, 1);
+    msgpack_pack_str(&pck, 8);
+    msgpack_pack_str_body(&pck, "intValue", 8);
+    msgpack_pack_str(&pck, 1);
+    msgpack_pack_str_body(&pck, "1", 1);
+
+    msgpack_unpacked_init(&up);
+    msgpack_unpack_next(&up, sbuf.data, sbuf.size, NULL);
+
+    ret = flb_otel_utils_json_payload_get_wrapped_value(&up.data, &val, &type);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(type == MSGPACK_OBJECT_POSITIVE_INTEGER);
+    TEST_CHECK(val->type == MSGPACK_OBJECT_STR);
+
+    msgpack_sbuffer_destroy(&sbuf);
+    msgpack_unpacked_destroy(&up);
 }
 
-#define OTEL_TEST_CASES_PATH      FLB_TESTS_DATA_PATH "/data/opentelemetry/test_cases.json"
+#define OTEL_TEST_CASES_PATH      FLB_TESTS_DATA_PATH "/data/opentelemetry/logs.json"
+#define OTEL_TRACES_TEST_CASES_PATH FLB_TESTS_DATA_PATH "/data/opentelemetry/traces.json"
+#define OTEL_METRICS_TEST_CASES_PATH FLB_TESTS_DATA_PATH "/data/opentelemetry/metrics.json"
+
+static flb_sds_t test_normalize_json(const char *input)
+{
+    char      *buffer;
+    size_t     length;
+    flb_sds_t  normalized;
+    struct flb_json_doc *doc;
+
+    doc = flb_json_read(input, strlen(input));
+    if (doc == NULL) {
+        return NULL;
+    }
+
+    buffer = flb_json_write(doc, &length);
+    flb_json_doc_destroy(doc);
+    if (buffer == NULL) {
+        return NULL;
+    }
+
+    normalized = flb_sds_create_len(buffer, length);
+    flb_free(buffer);
+
+    return normalized;
+}
+
+static void destroy_metrics_context_list(struct cfl_list *context_list)
+{
+    struct cfl_list *iterator;
+    struct cfl_list *tmp;
+    struct cmt      *context;
+
+    if (context_list == NULL) {
+        return;
+    }
+
+    cfl_list_foreach_safe(iterator, tmp, context_list) {
+        context = cfl_list_entry(iterator, struct cmt, _head);
+        cfl_list_del(&context->_head);
+        cmt_destroy(context);
+    }
+}
+
+static int test_msgpack_object_to_double(msgpack_object *object, double *value)
+{
+    if (object->type == MSGPACK_OBJECT_FLOAT32 ||
+        object->type == MSGPACK_OBJECT_FLOAT64) {
+        *value = object->via.f64;
+        return 0;
+    }
+
+    if (object->type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+        *value = (double) object->via.u64;
+        return 0;
+    }
+
+    if (object->type == MSGPACK_OBJECT_NEGATIVE_INTEGER) {
+        *value = (double) object->via.i64;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int test_metrics_expected_error_code(const char *error_code_name)
+{
+    if (strcmp(error_code_name,
+               "CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR") == 0) {
+        return CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    }
+
+    if (strcmp(error_code_name,
+               "CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR") == 0) {
+        return CMT_DECODE_OPENTELEMETRY_ALLOCATION_ERROR;
+    }
+
+    if (strcmp(error_code_name,
+               "CMT_DECODE_OPENTELEMETRY_KVLIST_ACCESS_ERROR") == 0) {
+        return CMT_DECODE_OPENTELEMETRY_KVLIST_ACCESS_ERROR;
+    }
+
+    if (strcmp(error_code_name,
+               "CMT_DECODE_OPENTELEMETRY_ARRAY_ACCESS_ERROR") == 0) {
+        return CMT_DECODE_OPENTELEMETRY_ARRAY_ACCESS_ERROR;
+    }
+
+    return -1;
+}
+
+static int test_msgpack_object_to_int(msgpack_object *object, int *value)
+{
+    if (object->type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+        *value = (int) object->via.u64;
+        return 0;
+    }
+
+    if (object->type == MSGPACK_OBJECT_NEGATIVE_INTEGER) {
+        *value = (int) object->via.i64;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int test_msgpack_object_to_u64(msgpack_object *object, uint64_t *value)
+{
+    if (object->type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+        *value = object->via.u64;
+        return 0;
+    }
+
+    if (object->type == MSGPACK_OBJECT_NEGATIVE_INTEGER) {
+        if (object->via.i64 < 0) {
+            return -1;
+        }
+        *value = object->via.i64;
+        return 0;
+    }
+
+    return -1;
+}
+
+static void test_destroy_label_values(int label_count, char **label_values)
+{
+    int index;
+
+    if (label_values == NULL) {
+        return;
+    }
+
+    for (index = 0; index < label_count; index++) {
+        if (label_values[index] != NULL) {
+            flb_free(label_values[index]);
+        }
+    }
+
+    flb_free(label_values);
+}
+
+static int test_extract_label_values(msgpack_object_map *container_map,
+                                     char *field_name,
+                                     int *out_label_count,
+                                     char ***out_label_values)
+{
+    int             index;
+    int             label_index;
+    char          **label_values;
+    msgpack_object *field_obj;
+    msgpack_object_array *label_array;
+
+    *out_label_count = 0;
+    *out_label_values = NULL;
+
+    index = flb_otel_utils_find_map_entry_by_key(container_map,
+                                                  field_name,
+                                                  0,
+                                                  FLB_TRUE);
+    if (index < 0) {
+        return 0;
+    }
+
+    field_obj = &container_map->ptr[index].val;
+    if (field_obj->type != MSGPACK_OBJECT_ARRAY) {
+        return -1;
+    }
+
+    label_array = &field_obj->via.array;
+    if (label_array->size == 0) {
+        return 0;
+    }
+
+    label_values = flb_calloc(label_array->size, sizeof(char *));
+    if (label_values == NULL) {
+        flb_errno();
+        return -1;
+    }
+
+    for (label_index = 0; label_index < label_array->size; label_index++) {
+        field_obj = &label_array->ptr[label_index];
+        if (field_obj->type != MSGPACK_OBJECT_STR) {
+            test_destroy_label_values((int) label_array->size, label_values);
+            return -1;
+        }
+
+        label_values[label_index] = flb_malloc(field_obj->via.str.size + 1);
+        if (label_values[label_index] == NULL) {
+            flb_errno();
+            test_destroy_label_values((int) label_array->size, label_values);
+            return -1;
+        }
+
+        memcpy(label_values[label_index],
+               field_obj->via.str.ptr,
+               field_obj->via.str.size);
+        label_values[label_index][field_obj->via.str.size] = '\0';
+    }
+
+    *out_label_count = (int) label_array->size;
+    *out_label_values = label_values;
+
+    return 0;
+}
+
+static void test_check_metric_description_unit(msgpack_object *metric_obj,
+                                               struct cmt_opts *opts,
+                                               struct cmt_map *map)
+{
+    int             index;
+    msgpack_object *field_obj;
+
+    if (metric_obj == NULL || opts == NULL || map == NULL ||
+        metric_obj->type != MSGPACK_OBJECT_MAP) {
+        return;
+    }
+
+    index = flb_otel_utils_find_map_entry_by_key(&metric_obj->via.map,
+                                                  "description",
+                                                  0,
+                                                  FLB_TRUE);
+    if (index >= 0) {
+        field_obj = &metric_obj->via.map.ptr[index].val;
+        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_STR);
+        if (field_obj->type == MSGPACK_OBJECT_STR) {
+            TEST_CHECK(opts->description != NULL);
+            TEST_CHECK(strlen(opts->description) == field_obj->via.str.size);
+            TEST_CHECK(strncmp(opts->description,
+                               field_obj->via.str.ptr,
+                               field_obj->via.str.size) == 0);
+        }
+    }
+
+    index = flb_otel_utils_find_map_entry_by_key(&metric_obj->via.map,
+                                                  "unit",
+                                                  0,
+                                                  FLB_TRUE);
+    if (index >= 0) {
+        field_obj = &metric_obj->via.map.ptr[index].val;
+        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_STR);
+        if (field_obj->type == MSGPACK_OBJECT_STR) {
+            TEST_CHECK(map->unit != NULL);
+            TEST_CHECK(strlen(map->unit) == field_obj->via.str.size);
+            TEST_CHECK(strncmp(map->unit,
+                               field_obj->via.str.ptr,
+                               field_obj->via.str.size) == 0);
+        }
+    }
+}
+
+static void run_metrics_case(msgpack_object *case_obj, const char *case_name)
+{
+    int               ret;
+    int               index;
+    int               expected_result;
+    int               expected_aggregation_type;
+    int               context_count;
+    int               expected_allow_reset;
+    double            value;
+    double            expected_value;
+    msgpack_object   *input_obj;
+    msgpack_object   *expected_obj;
+    msgpack_object   *gauge_obj;
+    msgpack_object   *counter_obj;
+    msgpack_object   *histogram_obj;
+    msgpack_object   *summary_obj;
+    msgpack_object   *error_obj;
+    msgpack_object   *field_obj;
+    char             *input_json;
+    char             *error_code_name;
+    struct cfl_list   context_list;
+    struct cmt       *context;
+    struct cmt_gauge *gauge;
+    struct cmt_counter *counter;
+    struct cmt_histogram *histogram;
+    struct cmt_exp_histogram *exp_histogram;
+    struct cmt_summary *summary;
+    struct cmt_metric *metric;
+    int               expected_gauge_count;
+    int               expected_counter_count;
+    int               expected_histogram_count;
+    int               expected_exp_histogram_count;
+    int               expected_summary_count;
+    int               gauge_index;
+    int               counter_index;
+    int               histogram_index;
+    int               exp_histogram_index;
+    int               summary_index;
+    msgpack_object   *exp_histogram_obj;
+    uint64_t          expected_count;
+    int               decode_ret;
+    int               expected_label_count;
+    char            **expected_label_values;
+
+    input_json = NULL;
+    decode_ret = CMT_DECODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR;
+    expected_label_count = 0;
+    expected_label_values = NULL;
+    (void) case_name;
+    TEST_CHECK(case_obj->type == MSGPACK_OBJECT_MAP);
+    if (case_obj->type != MSGPACK_OBJECT_MAP) {
+        return;
+    }
+
+    index = flb_otel_utils_find_map_entry_by_key(&case_obj->via.map,
+                                                  "input",
+                                                  0,
+                                                  FLB_TRUE);
+    TEST_CHECK(index >= 0);
+    if (index < 0) {
+        return;
+    }
+
+    input_obj = &case_obj->via.map.ptr[index].val;
+    input_json = flb_msgpack_to_json_str(4096, input_obj, FLB_TRUE);
+    TEST_CHECK(input_json != NULL);
+    if (input_json == NULL) {
+        return;
+    }
+
+    expected_result = CMT_DECODE_OPENTELEMETRY_SUCCESS;
+
+    index = flb_otel_utils_find_map_entry_by_key(&case_obj->via.map,
+                                                  "expected_error",
+                                                  0,
+                                                  FLB_TRUE);
+    if (index >= 0) {
+        error_obj = &case_obj->via.map.ptr[index].val;
+        TEST_CHECK(error_obj->type == MSGPACK_OBJECT_MAP);
+        if (error_obj->type == MSGPACK_OBJECT_MAP) {
+            index = flb_otel_utils_find_map_entry_by_key(&error_obj->via.map,
+                                                         "code",
+                                                         0,
+                                                         FLB_TRUE);
+            TEST_CHECK(index >= 0);
+            if (index >= 0) {
+                field_obj = &error_obj->via.map.ptr[index].val;
+                TEST_CHECK(field_obj->type == MSGPACK_OBJECT_STR);
+                if (field_obj->type == MSGPACK_OBJECT_STR) {
+                    error_code_name = flb_malloc(field_obj->via.str.size + 1);
+                    TEST_CHECK(error_code_name != NULL);
+                    if (error_code_name != NULL) {
+                        memcpy(error_code_name,
+                               field_obj->via.str.ptr,
+                               field_obj->via.str.size);
+                        error_code_name[field_obj->via.str.size] = '\0';
+                        expected_result =
+                            test_metrics_expected_error_code(error_code_name);
+                        flb_free(error_code_name);
+                    }
+                }
+            }
+        }
+    }
+
+    ret = flb_opentelemetry_metrics_json_to_cmt(&context_list,
+                                                input_json,
+                                                strlen(input_json));
+    decode_ret = ret;
+    TEST_CHECK(ret == expected_result);
+
+    if (expected_result == CMT_DECODE_OPENTELEMETRY_SUCCESS) {
+        index = flb_otel_utils_find_map_entry_by_key(&case_obj->via.map,
+                                                      "expected",
+                                                      0,
+                                                      FLB_TRUE);
+        TEST_CHECK(index >= 0);
+        if (index >= 0) {
+            expected_obj = &case_obj->via.map.ptr[index].val;
+            TEST_CHECK(expected_obj->type == MSGPACK_OBJECT_MAP);
+            if (expected_obj->type == MSGPACK_OBJECT_MAP) {
+                index = flb_otel_utils_find_map_entry_by_key(&expected_obj->via.map,
+                                                              "context_count",
+                                                              0,
+                                                              FLB_TRUE);
+                TEST_CHECK(index >= 0);
+                if (index >= 0 &&
+                    expected_obj->via.map.ptr[index].val.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                    context_count = (int) expected_obj->via.map.ptr[index].val.via.u64;
+                    TEST_CHECK(cfl_list_size(&context_list) == context_count);
+                }
+
+                expected_gauge_count = -1;
+                index = flb_otel_utils_find_map_entry_by_key(&expected_obj->via.map,
+                                                              "gauge_count",
+                                                              0,
+                                                              FLB_TRUE);
+                if (index >= 0) {
+                    field_obj = &expected_obj->via.map.ptr[index].val;
+                    TEST_CHECK(test_msgpack_object_to_int(field_obj,
+                                                          &expected_gauge_count) == 0);
+                }
+
+                expected_counter_count = -1;
+                index = flb_otel_utils_find_map_entry_by_key(&expected_obj->via.map,
+                                                              "counter_count",
+                                                              0,
+                                                              FLB_TRUE);
+                if (index >= 0) {
+                    field_obj = &expected_obj->via.map.ptr[index].val;
+                    TEST_CHECK(test_msgpack_object_to_int(field_obj,
+                                                          &expected_counter_count) == 0);
+                }
+
+                expected_histogram_count = -1;
+                index = flb_otel_utils_find_map_entry_by_key(&expected_obj->via.map,
+                                                              "histogram_count",
+                                                              0,
+                                                              FLB_TRUE);
+                if (index >= 0) {
+                    field_obj = &expected_obj->via.map.ptr[index].val;
+                    TEST_CHECK(test_msgpack_object_to_int(field_obj,
+                                                          &expected_histogram_count) == 0);
+                }
+
+                expected_summary_count = -1;
+                index = flb_otel_utils_find_map_entry_by_key(&expected_obj->via.map,
+                                                              "summary_count",
+                                                              0,
+                                                              FLB_TRUE);
+                if (index >= 0) {
+                    field_obj = &expected_obj->via.map.ptr[index].val;
+                    TEST_CHECK(test_msgpack_object_to_int(field_obj,
+                                                          &expected_summary_count) == 0);
+                }
+
+                expected_exp_histogram_count = -1;
+                index = flb_otel_utils_find_map_entry_by_key(&expected_obj->via.map,
+                                                              "exp_histogram_count",
+                                                              0,
+                                                              FLB_TRUE);
+                if (index >= 0) {
+                    field_obj = &expected_obj->via.map.ptr[index].val;
+                    TEST_CHECK(test_msgpack_object_to_int(field_obj,
+                                                          &expected_exp_histogram_count) == 0);
+                }
+
+                context = cfl_list_entry(context_list.next, struct cmt, _head);
+
+                if (expected_gauge_count >= 0) {
+                    TEST_CHECK(cfl_list_size(&context->gauges) == expected_gauge_count);
+                }
+
+                if (expected_counter_count >= 0) {
+                    TEST_CHECK(cfl_list_size(&context->counters) == expected_counter_count);
+                }
+
+                if (expected_histogram_count >= 0) {
+                    TEST_CHECK(cfl_list_size(&context->histograms) ==
+                               expected_histogram_count);
+                }
+
+                if (expected_summary_count >= 0) {
+                    TEST_CHECK(cfl_list_size(&context->summaries) ==
+                               expected_summary_count);
+                }
+
+                if (expected_exp_histogram_count >= 0) {
+                    TEST_CHECK(cfl_list_size(&context->exp_histograms) ==
+                               expected_exp_histogram_count);
+                }
+
+                gauge_index = flb_otel_utils_find_map_entry_by_key(&expected_obj->via.map,
+                                                                    "gauge",
+                                                                    0,
+                                                                    FLB_TRUE);
+                if (gauge_index >= 0) {
+                    gauge_obj = &expected_obj->via.map.ptr[gauge_index].val;
+                    gauge = cfl_list_entry(context->gauges.next,
+                                           struct cmt_gauge, _head);
+                    test_check_metric_description_unit(gauge_obj,
+                                                       &gauge->opts,
+                                                       gauge->map);
+
+                    index = flb_otel_utils_find_map_entry_by_key(&gauge_obj->via.map,
+                                                                  "name",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &gauge_obj->via.map.ptr[index].val;
+                        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_STR);
+                        if (field_obj->type == MSGPACK_OBJECT_STR) {
+                            TEST_CHECK(strlen(gauge->opts.name) ==
+                                       field_obj->via.str.size);
+                            TEST_CHECK(strncmp(gauge->opts.name,
+                                               field_obj->via.str.ptr,
+                                               field_obj->via.str.size) == 0);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&gauge_obj->via.map,
+                                                                  "value",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &gauge_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_double(field_obj,
+                                                                 &expected_value) == 0);
+                        if (test_msgpack_object_to_double(field_obj,
+                                                          &expected_value) == 0) {
+                            ret = test_extract_label_values(&gauge_obj->via.map,
+                                                            "label_values",
+                                                            &expected_label_count,
+                                                            &expected_label_values);
+                            TEST_CHECK(ret == 0);
+                            ret = cmt_gauge_get_val(gauge,
+                                                    expected_label_count,
+                                                    expected_label_values,
+                                                    &value);
+                            TEST_CHECK(ret == 0);
+                            TEST_CHECK(value == expected_value);
+                            test_destroy_label_values(expected_label_count,
+                                                      expected_label_values);
+                            expected_label_count = 0;
+                            expected_label_values = NULL;
+                        }
+                    }
+                }
+
+                counter_index = flb_otel_utils_find_map_entry_by_key(&expected_obj->via.map,
+                                                                      "counter",
+                                                                      0,
+                                                                      FLB_TRUE);
+                if (counter_index >= 0) {
+                    counter_obj = &expected_obj->via.map.ptr[counter_index].val;
+                    counter = cfl_list_entry(context->counters.next,
+                                             struct cmt_counter, _head);
+                    test_check_metric_description_unit(counter_obj,
+                                                       &counter->opts,
+                                                       counter->map);
+
+                    index = flb_otel_utils_find_map_entry_by_key(&counter_obj->via.map,
+                                                                  "name",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &counter_obj->via.map.ptr[index].val;
+                        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_STR);
+                        if (field_obj->type == MSGPACK_OBJECT_STR) {
+                            TEST_CHECK(strlen(counter->opts.name) ==
+                                       field_obj->via.str.size);
+                            TEST_CHECK(strncmp(counter->opts.name,
+                                               field_obj->via.str.ptr,
+                                               field_obj->via.str.size) == 0);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&counter_obj->via.map,
+                                                                  "value",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &counter_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_double(field_obj,
+                                                                 &expected_value) == 0);
+                        if (test_msgpack_object_to_double(field_obj,
+                                                          &expected_value) == 0) {
+                            ret = test_extract_label_values(&counter_obj->via.map,
+                                                            "label_values",
+                                                            &expected_label_count,
+                                                            &expected_label_values);
+                            TEST_CHECK(ret == 0);
+                            ret = cmt_counter_get_val(counter,
+                                                      expected_label_count,
+                                                      expected_label_values,
+                                                      &value);
+                            TEST_CHECK(ret == 0);
+                            TEST_CHECK(value == expected_value);
+                            test_destroy_label_values(expected_label_count,
+                                                      expected_label_values);
+                            expected_label_count = 0;
+                            expected_label_values = NULL;
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&counter_obj->via.map,
+                                                                  "allow_reset",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &counter_obj->via.map.ptr[index].val;
+                        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_BOOLEAN);
+                        if (field_obj->type == MSGPACK_OBJECT_BOOLEAN) {
+                            expected_allow_reset = field_obj->via.boolean;
+                            TEST_CHECK(counter->allow_reset == expected_allow_reset);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&counter_obj->via.map,
+                                                                  "aggregation_type",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &counter_obj->via.map.ptr[index].val;
+                        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_POSITIVE_INTEGER);
+                        if (field_obj->type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                            expected_aggregation_type = field_obj->via.u64;
+                            TEST_CHECK(counter->aggregation_type ==
+                                       expected_aggregation_type);
+                        }
+                    }
+                }
+
+                histogram_index = flb_otel_utils_find_map_entry_by_key(
+                                      &expected_obj->via.map,
+                                      "histogram",
+                                      0,
+                                      FLB_TRUE);
+                if (histogram_index >= 0) {
+                    histogram_obj = &expected_obj->via.map.ptr[histogram_index].val;
+                    histogram = cfl_list_entry(context->histograms.next,
+                                               struct cmt_histogram, _head);
+                    metric = &histogram->map->metric;
+                    test_check_metric_description_unit(histogram_obj,
+                                                       &histogram->opts,
+                                                       histogram->map);
+
+                    index = flb_otel_utils_find_map_entry_by_key(&histogram_obj->via.map,
+                                                                  "name",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &histogram_obj->via.map.ptr[index].val;
+                        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_STR);
+                        if (field_obj->type == MSGPACK_OBJECT_STR) {
+                            TEST_CHECK(strlen(histogram->opts.name) ==
+                                       field_obj->via.str.size);
+                            TEST_CHECK(strncmp(histogram->opts.name,
+                                               field_obj->via.str.ptr,
+                                               field_obj->via.str.size) == 0);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&histogram_obj->via.map,
+                                                                  "count",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &histogram_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_u64(field_obj,
+                                                              &expected_count) == 0);
+                        if (test_msgpack_object_to_u64(field_obj,
+                                                       &expected_count) == 0) {
+                            TEST_CHECK(cmt_metric_hist_get_count_value(metric) ==
+                                       expected_count);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&histogram_obj->via.map,
+                                                                  "sum",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &histogram_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_double(field_obj,
+                                                                 &expected_value) == 0);
+                        if (test_msgpack_object_to_double(field_obj,
+                                                          &expected_value) == 0) {
+                            value = cmt_metric_hist_get_sum_value(metric);
+                            TEST_CHECK(value == expected_value);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&histogram_obj->via.map,
+                                                                  "aggregation_type",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    if (index >= 0) {
+                        field_obj = &histogram_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_int(field_obj,
+                                                              &expected_aggregation_type) == 0);
+                        if (test_msgpack_object_to_int(field_obj,
+                                                       &expected_aggregation_type) == 0) {
+                            TEST_CHECK(histogram->aggregation_type ==
+                                       expected_aggregation_type);
+                        }
+                    }
+                }
+
+                summary_index = flb_otel_utils_find_map_entry_by_key(
+                                    &expected_obj->via.map,
+                                    "summary",
+                                    0,
+                                    FLB_TRUE);
+                if (summary_index >= 0) {
+                    summary_obj = &expected_obj->via.map.ptr[summary_index].val;
+                    summary = cfl_list_entry(context->summaries.next,
+                                             struct cmt_summary, _head);
+                    metric = &summary->map->metric;
+                    test_check_metric_description_unit(summary_obj,
+                                                       &summary->opts,
+                                                       summary->map);
+
+                    index = flb_otel_utils_find_map_entry_by_key(&summary_obj->via.map,
+                                                                  "name",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &summary_obj->via.map.ptr[index].val;
+                        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_STR);
+                        if (field_obj->type == MSGPACK_OBJECT_STR) {
+                            TEST_CHECK(strlen(summary->opts.name) ==
+                                       field_obj->via.str.size);
+                            TEST_CHECK(strncmp(summary->opts.name,
+                                               field_obj->via.str.ptr,
+                                               field_obj->via.str.size) == 0);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&summary_obj->via.map,
+                                                                  "count",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &summary_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_u64(field_obj,
+                                                              &expected_count) == 0);
+                        if (test_msgpack_object_to_u64(field_obj,
+                                                       &expected_count) == 0) {
+                            TEST_CHECK(cmt_summary_get_count_value(metric) ==
+                                       expected_count);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(&summary_obj->via.map,
+                                                                  "sum",
+                                                                  0,
+                                                                  FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &summary_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_double(field_obj,
+                                                                 &expected_value) == 0);
+                        if (test_msgpack_object_to_double(field_obj,
+                                                          &expected_value) == 0) {
+                            value = cmt_summary_get_sum_value(metric);
+                            TEST_CHECK(value == expected_value);
+                        }
+                    }
+                }
+
+                exp_histogram_index = flb_otel_utils_find_map_entry_by_key(
+                                          &expected_obj->via.map,
+                                          "exp_histogram",
+                                          0,
+                                          FLB_TRUE);
+                if (exp_histogram_index >= 0) {
+                    exp_histogram_obj = &expected_obj->via.map.ptr[exp_histogram_index].val;
+                    exp_histogram = cfl_list_entry(context->exp_histograms.next,
+                                                   struct cmt_exp_histogram, _head);
+                    metric = &exp_histogram->map->metric;
+                    test_check_metric_description_unit(exp_histogram_obj,
+                                                       &exp_histogram->opts,
+                                                       exp_histogram->map);
+
+                    index = flb_otel_utils_find_map_entry_by_key(
+                                &exp_histogram_obj->via.map,
+                                "name",
+                                0,
+                                FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &exp_histogram_obj->via.map.ptr[index].val;
+                        TEST_CHECK(field_obj->type == MSGPACK_OBJECT_STR);
+                        if (field_obj->type == MSGPACK_OBJECT_STR) {
+                            TEST_CHECK(strlen(exp_histogram->opts.name) ==
+                                       field_obj->via.str.size);
+                            TEST_CHECK(strncmp(exp_histogram->opts.name,
+                                               field_obj->via.str.ptr,
+                                               field_obj->via.str.size) == 0);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(
+                                &exp_histogram_obj->via.map,
+                                "count",
+                                0,
+                                FLB_TRUE);
+                    TEST_CHECK(index >= 0);
+                    if (index >= 0) {
+                        field_obj = &exp_histogram_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_u64(field_obj,
+                                                              &expected_count) == 0);
+                        if (test_msgpack_object_to_u64(field_obj,
+                                                       &expected_count) == 0) {
+                            TEST_CHECK(metric->exp_hist_count == expected_count);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(
+                                &exp_histogram_obj->via.map,
+                                "sum",
+                                0,
+                                FLB_TRUE);
+                    if (index >= 0) {
+                        field_obj = &exp_histogram_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_double(field_obj,
+                                                                 &expected_value) == 0);
+                        if (test_msgpack_object_to_double(field_obj,
+                                                          &expected_value) == 0) {
+                            value = cmt_math_uint64_to_d64(metric->exp_hist_sum);
+                            TEST_CHECK(value == expected_value);
+                        }
+                    }
+
+                    index = flb_otel_utils_find_map_entry_by_key(
+                                &exp_histogram_obj->via.map,
+                                "aggregation_type",
+                                0,
+                                FLB_TRUE);
+                    if (index >= 0) {
+                        field_obj = &exp_histogram_obj->via.map.ptr[index].val;
+                        TEST_CHECK(test_msgpack_object_to_int(field_obj,
+                                                              &expected_aggregation_type) == 0);
+                        if (test_msgpack_object_to_int(field_obj,
+                                                       &expected_aggregation_type) == 0) {
+                            TEST_CHECK(exp_histogram->aggregation_type ==
+                                       expected_aggregation_type);
+                        }
+                    }
+                }
+
+            }
+        }
+    }
+
+    if (decode_ret == CMT_DECODE_OPENTELEMETRY_SUCCESS) {
+        destroy_metrics_context_list(&context_list);
+    }
+
+    test_destroy_label_values(expected_label_count, expected_label_values);
+
+    flb_free(input_json);
+}
 
 void test_opentelemetry_cases()
 {
@@ -547,7 +1504,7 @@ void test_opentelemetry_cases()
 
         ret = flb_otel_utils_find_map_entry_by_key(&case_obj->via.map, "input", 0, FLB_TRUE);
         TEST_CHECK(ret >= 0);
-        input_json = flb_msgpack_to_json_str(1024, &case_obj->via.map.ptr[ret].val);
+        input_json = flb_msgpack_to_json_str(1024, &case_obj->via.map.ptr[ret].val, FLB_TRUE);
         TEST_CHECK(input_json != NULL);
 
         ret = flb_log_event_encoder_init(&enc, FLB_LOG_EVENT_FORMAT_FLUENT_BIT_V2);
@@ -581,22 +1538,22 @@ void test_opentelemetry_cases()
             if (empty_payload == FLB_FALSE && has_groups == FLB_FALSE) {
                 ret = flb_otel_utils_find_map_entry_by_key(&expected->via.map, "group_metadata", 0, FLB_TRUE);
                 TEST_CHECK(ret >= 0);
-                expect_group_meta = flb_msgpack_to_json_str(256, &expected->via.map.ptr[ret].val);
+                expect_group_meta = flb_msgpack_to_json_str(256, &expected->via.map.ptr[ret].val, FLB_TRUE);
                 TEST_CHECK(expect_group_meta != NULL);
 
                 ret = flb_otel_utils_find_map_entry_by_key(&expected->via.map, "group_body", 0, FLB_TRUE);
                 TEST_CHECK(ret >= 0);
-                expect_group_body = flb_msgpack_to_json_str(256, &expected->via.map.ptr[ret].val);
+                expect_group_body = flb_msgpack_to_json_str(256, &expected->via.map.ptr[ret].val, FLB_TRUE);
                 TEST_CHECK(expect_group_body != NULL);
 
                 ret = flb_otel_utils_find_map_entry_by_key(&expected->via.map, "log_metadata", 0, FLB_TRUE);
                 TEST_CHECK(ret >= 0);
-                expect_log_meta = flb_msgpack_to_json_str(256, &expected->via.map.ptr[ret].val);
+                expect_log_meta = flb_msgpack_to_json_str(256, &expected->via.map.ptr[ret].val, FLB_TRUE);
                 TEST_CHECK(expect_log_meta != NULL);
 
                 ret = flb_otel_utils_find_map_entry_by_key(&expected->via.map, "log_body", 0, FLB_TRUE);
                 TEST_CHECK(ret >= 0);
-                expect_log_body = flb_msgpack_to_json_str(256, &expected->via.map.ptr[ret].val);
+                expect_log_body = flb_msgpack_to_json_str(256, &expected->via.map.ptr[ret].val, FLB_TRUE);
                 TEST_CHECK(expect_log_body != NULL);
             }
 
@@ -737,6 +1694,133 @@ void test_opentelemetry_cases()
     flb_free(cases_json);
 }
 
+void test_opentelemetry_traces_cases()
+{
+    int ret;
+    char *cases_json;
+    char *tmp_buf = NULL;
+    size_t tmp_size;
+    int type;
+    msgpack_unpacked result;
+    msgpack_object *root;
+    size_t i;
+
+    cases_json = mk_file_to_buffer(OTEL_TRACES_TEST_CASES_PATH);
+    TEST_CHECK(cases_json != NULL);
+    if (cases_json == NULL) {
+        flb_error("could not read trace test cases from '%s'", OTEL_TRACES_TEST_CASES_PATH);
+        return;
+    }
+
+    ret = flb_pack_json(cases_json, strlen(cases_json), &tmp_buf, &tmp_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        flb_error("could not convert trace test cases to msgpack from '%s'", OTEL_TRACES_TEST_CASES_PATH);
+        flb_free(cases_json);
+        return;
+    }
+
+    msgpack_unpacked_init(&result);
+    ret = msgpack_unpack_next(&result, tmp_buf, tmp_size, NULL);
+    TEST_CHECK(ret == MSGPACK_UNPACK_SUCCESS);
+    if (ret != MSGPACK_UNPACK_SUCCESS) {
+        msgpack_unpacked_destroy(&result);
+        flb_free(tmp_buf);
+        flb_free(cases_json);
+        return;
+    }
+
+    root = &result.data;
+
+    for (i = 0; i < root->via.map.size; i++) {
+        msgpack_object *case_obj;
+        char *case_name;
+        char *input_json = NULL;
+        struct ctrace *ctr = NULL;
+        int error_status = 0;
+        int expect_error = FLB_FALSE;
+        int expected_code = 0;
+
+        case_name = flb_malloc(root->via.map.ptr[i].key.via.str.size + 1);
+        if (!case_name) {
+            flb_errno();
+            continue;
+        }
+        memcpy(case_name,
+               root->via.map.ptr[i].key.via.str.ptr,
+               root->via.map.ptr[i].key.via.str.size);
+        case_name[root->via.map.ptr[i].key.via.str.size] = '\0';
+        printf(">> running trace test case '%s'\n", case_name);
+
+        case_obj = &root->via.map.ptr[i].val;
+
+        ret = flb_otel_utils_find_map_entry_by_key(&case_obj->via.map, "input", 0, FLB_TRUE);
+        TEST_CHECK(ret >= 0);
+        if (ret < 0) {
+            flb_free(case_name);
+            continue;
+        }
+
+        input_json = flb_msgpack_to_json_str(512, &case_obj->via.map.ptr[ret].val, FLB_TRUE);
+        TEST_CHECK(input_json != NULL);
+        if (input_json == NULL) {
+            flb_free(case_name);
+            continue;
+        }
+
+        ret = flb_otel_utils_find_map_entry_by_key(&case_obj->via.map, "expected_error", 0, FLB_TRUE);
+        if (ret >= 0) {
+            msgpack_object *exp_obj;
+            int code_idx;
+
+            exp_obj = &case_obj->via.map.ptr[ret].val;
+            code_idx = flb_otel_utils_find_map_entry_by_key(&exp_obj->via.map, "code", 0, FLB_TRUE);
+            TEST_CHECK(code_idx >= 0);
+            if (code_idx >= 0 && exp_obj->via.map.ptr[code_idx].val.type == MSGPACK_OBJECT_STR) {
+                char *code_str;
+
+                code_str = flb_malloc(exp_obj->via.map.ptr[code_idx].val.via.str.size + 1);
+                if (code_str) {
+                    memcpy(code_str,
+                           exp_obj->via.map.ptr[code_idx].val.via.str.ptr,
+                           exp_obj->via.map.ptr[code_idx].val.via.str.size);
+                    code_str[exp_obj->via.map.ptr[code_idx].val.via.str.size] = '\0';
+                    expected_code = flb_opentelemetry_error_code(code_str);
+                    TEST_CHECK(expected_code != -1000);
+                    flb_free(code_str);
+                    expect_error = FLB_TRUE;
+                }
+            }
+        }
+
+        ctr = flb_opentelemetry_json_traces_to_ctrace(input_json, strlen(input_json), &error_status);
+
+        if (expect_error == FLB_TRUE) {
+            TEST_CHECK_(ctr == NULL, "trace case %s should fail", case_name);
+            TEST_CHECK_(error_status == expected_code,
+                       "trace case %s expected status %d got %d",
+                       case_name, expected_code, error_status);
+        }
+        else {
+            TEST_CHECK_(ctr != NULL, "trace case %s should succeed", case_name);
+            TEST_CHECK_(error_status == 0,
+                       "trace case %s expected success status 0 got %d",
+                       case_name, error_status);
+        }
+
+        if (ctr) {
+            ctr_destroy(ctr);
+        }
+
+        flb_free(input_json);
+        flb_free(case_name);
+    }
+
+    msgpack_unpacked_destroy(&result);
+    flb_free(tmp_buf);
+    flb_free(cases_json);
+}
+
 void test_trace_span_binary_sizes()
 {
     int ret;
@@ -754,7 +1838,6 @@ void test_trace_span_binary_sizes()
     struct flb_record_accessor *ra_span_id;
     struct flb_ra_value *val_trace_id;
     struct flb_ra_value *val_span_id;
-    size_t len;
 
     /* Test input with trace_id and span_id */
     input_json = "{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"1640995200000000000\",\"traceId\":\"5B8EFFF798038103D269B633813FC60C\",\"spanId\":\"EEE19B7EC3C1B174\",\"body\":{\"stringValue\":\"test\"}}]}]}]}";
@@ -826,14 +1909,1543 @@ void test_trace_span_binary_sizes()
     TEST_CHECK(found_span_id == 1);
 }
 
+void test_opentelemetry_metrics_cases()
+{
+    int               ret;
+    int               type;
+    size_t            index;
+    char             *tmp_buf;
+    char             *cases_json;
+    size_t            tmp_size;
+    msgpack_unpacked  result;
+    msgpack_object   *root;
+    msgpack_object   *case_obj;
+    char             *case_name;
+
+    tmp_buf = NULL;
+    cmt_initialize();
+
+    cases_json = mk_file_to_buffer(OTEL_METRICS_TEST_CASES_PATH);
+
+    TEST_CHECK(cases_json != NULL);
+    if (cases_json == NULL) {
+        flb_error("could not read metrics test cases from '%s'",
+                  OTEL_METRICS_TEST_CASES_PATH);
+        return;
+    }
+
+    ret = flb_pack_json(cases_json, strlen(cases_json),
+                        &tmp_buf, &tmp_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        flb_free(cases_json);
+        return;
+    }
+
+    msgpack_unpacked_init(&result);
+    ret = msgpack_unpack_next(&result, tmp_buf, tmp_size, NULL);
+    TEST_CHECK(ret == MSGPACK_UNPACK_SUCCESS);
+    if (ret != MSGPACK_UNPACK_SUCCESS) {
+        msgpack_unpacked_destroy(&result);
+        flb_free(tmp_buf);
+        flb_free(cases_json);
+        return;
+    }
+
+    root = &result.data;
+    TEST_CHECK(root->type == MSGPACK_OBJECT_MAP);
+    if (root->type != MSGPACK_OBJECT_MAP) {
+        msgpack_unpacked_destroy(&result);
+        flb_free(tmp_buf);
+        flb_free(cases_json);
+        return;
+    }
+
+    for (index = 0; index < root->via.map.size; index++) {
+        case_name = flb_malloc(root->via.map.ptr[index].key.via.str.size + 1);
+        TEST_CHECK(case_name != NULL);
+        if (case_name == NULL) {
+            flb_errno();
+            break;
+        }
+
+        memcpy(case_name,
+               root->via.map.ptr[index].key.via.str.ptr,
+               root->via.map.ptr[index].key.via.str.size);
+        case_name[root->via.map.ptr[index].key.via.str.size] = '\0';
+
+        printf(">> running metrics test case '%s'\n", case_name);
+
+        case_obj = &root->via.map.ptr[index].val;
+        run_metrics_case(case_obj, case_name);
+
+        flb_free(case_name);
+    }
+
+    msgpack_unpacked_destroy(&result);
+    flb_free(tmp_buf);
+    flb_free(cases_json);
+}
+
+void test_opentelemetry_logs_otlp_json_roundtrip()
+{
+    int ret;
+    int result;
+    char *expected;
+    flb_sds_t actual;
+    flb_sds_t normalized_expected;
+    struct flb_log_event_encoder encoder;
+    struct flb_opentelemetry_otlp_logs_options options;
+
+    expected =
+        "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\","
+        "\"value\":{\"stringValue\":\"svc\"}}]},\"scopeLogs\":[{\"scope\":{\"name\":\"scope-a\","
+        "\"version\":\"1.0.0\",\"attributes\":[{\"key\":\"scope.key\",\"value\":{"
+        "\"stringValue\":\"scope.value\"}}]},\"logRecords\":[{\"timeUnixNano\":\"1640995200000000000\","
+        "\"observedTimeUnixNano\":\"1640995201000000000\",\"severityNumber\":9,"
+        "\"severityText\":\"INFO\",\"attributes\":[{\"key\":\"http.status_code\","
+        "\"value\":{\"intValue\":\"200\"}},{\"key\":\"retryable\",\"value\":{\"boolValue\":true}}],"
+        "\"traceId\":\"00112233445566778899aabbccddeeff\",\"spanId\":\"0011223344556677\","
+        "\"body\":{\"stringValue\":\"hello otlp\"}}]}]}]}";
+
+    ret = flb_log_event_encoder_init(&encoder,
+                                     FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        return;
+    }
+
+    ret = flb_opentelemetry_logs_json_to_msgpack(&encoder,
+                                                 expected,
+                                                 strlen(expected),
+                                                 "log",
+                                                 &result);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(result == 0);
+    if (ret != 0 || result != 0) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    memset(&options, 0, sizeof(options));
+    options.logs_require_otel_metadata = FLB_TRUE;
+    options.logs_body_key = "log";
+
+    actual = flb_opentelemetry_logs_to_otlp_json(encoder.output_buffer,
+                                                 encoder.output_length,
+                                                 &options,
+                                                 &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_JSON_SUCCESS);
+    if (actual == NULL) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    normalized_expected = test_normalize_json(expected);
+    TEST_CHECK(normalized_expected != NULL);
+    if (normalized_expected == NULL) {
+        flb_sds_destroy(actual);
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+    TEST_CHECK(strcmp(normalized_expected, actual) == 0);
+
+    flb_sds_destroy(normalized_expected);
+    flb_sds_destroy(actual);
+    flb_log_event_encoder_destroy(&encoder);
+}
+
+void test_opentelemetry_logs_otlp_json_preserves_appended_resources()
+{
+    int ret;
+    int result;
+    char *input_a;
+    char *input_b;
+    char *expected;
+    flb_sds_t actual;
+    flb_sds_t normalized_expected;
+    struct flb_log_event_encoder encoder;
+    struct flb_opentelemetry_otlp_logs_options options;
+
+    input_a =
+        "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"user.id\","
+        "\"value\":{\"stringValue\":\"user-a\"}}]},\"scopeLogs\":[{\"scope\":{},"
+        "\"logRecords\":[{\"timeUnixNano\":\"1640995200000000000\","
+        "\"body\":{\"stringValue\":\"event-a\"}}]}]}]}";
+
+    input_b =
+        "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"user.id\","
+        "\"value\":{\"stringValue\":\"user-b\"}}]},\"scopeLogs\":[{\"scope\":{},"
+        "\"logRecords\":[{\"timeUnixNano\":\"1640995201000000000\","
+        "\"body\":{\"stringValue\":\"event-b\"}}]}]}]}";
+
+    expected =
+        "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"user.id\","
+        "\"value\":{\"stringValue\":\"user-a\"}}]},\"scopeLogs\":[{\"scope\":{},"
+        "\"logRecords\":[{\"timeUnixNano\":\"1640995200000000000\","
+        "\"body\":{\"stringValue\":\"event-a\"}}]}]},{\"resource\":{\"attributes\":[{"
+        "\"key\":\"user.id\",\"value\":{\"stringValue\":\"user-b\"}}]},\"scopeLogs\":[{"
+        "\"scope\":{},\"logRecords\":[{\"timeUnixNano\":\"1640995201000000000\","
+        "\"body\":{\"stringValue\":\"event-b\"}}]}]}]}";
+
+    ret = flb_log_event_encoder_init(&encoder,
+                                     FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        return;
+    }
+
+    ret = flb_opentelemetry_logs_json_to_msgpack(&encoder,
+                                                 input_a,
+                                                 strlen(input_a),
+                                                 "log",
+                                                 &result);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(result == 0);
+
+    ret = flb_opentelemetry_logs_json_to_msgpack(&encoder,
+                                                 input_b,
+                                                 strlen(input_b),
+                                                 "log",
+                                                 &result);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(result == 0);
+    if (ret != 0 || result != 0) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    memset(&options, 0, sizeof(options));
+    options.logs_require_otel_metadata = FLB_TRUE;
+    options.logs_body_key = "log";
+
+    actual = flb_opentelemetry_logs_to_otlp_json(encoder.output_buffer,
+                                                 encoder.output_length,
+                                                 &options,
+                                                 &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_JSON_SUCCESS);
+    if (actual == NULL) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    normalized_expected = test_normalize_json(expected);
+    TEST_CHECK(normalized_expected != NULL);
+    if (normalized_expected == NULL) {
+        flb_sds_destroy(actual);
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    TEST_CHECK(strcmp(normalized_expected, actual) == 0);
+
+    flb_sds_destroy(normalized_expected);
+    flb_sds_destroy(actual);
+    flb_log_event_encoder_destroy(&encoder);
+}
+
+void test_opentelemetry_logs_otlp_resource_schema_url_identity()
+{
+    int ret;
+    int result;
+    char *input_a;
+    char *input_b;
+    char *expected;
+    flb_sds_t actual_json;
+    flb_sds_t actual_proto;
+    flb_sds_t normalized_expected;
+    struct flb_log_event_encoder encoder;
+    struct flb_opentelemetry_otlp_logs_options options;
+    Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest *decoded;
+
+    input_a =
+        "{\"resourceLogs\":[{\"schemaUrl\":\"schema-a\",\"resource\":{\"attributes\":[{"
+        "\"key\":\"service.name\",\"value\":{\"stringValue\":\"svc\"}}]},\"scopeLogs\":[{"
+        "\"scope\":{},\"logRecords\":[{\"timeUnixNano\":\"1640995200000000000\","
+        "\"body\":{\"stringValue\":\"event-a\"}}]}]}]}";
+
+    input_b =
+        "{\"resourceLogs\":[{\"schemaUrl\":\"schema-b\",\"resource\":{\"attributes\":[{"
+        "\"key\":\"service.name\",\"value\":{\"stringValue\":\"svc\"}}]},\"scopeLogs\":[{"
+        "\"scope\":{},\"logRecords\":[{\"timeUnixNano\":\"1640995201000000000\","
+        "\"body\":{\"stringValue\":\"event-b\"}}]}]}]}";
+
+    expected =
+        "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\","
+        "\"value\":{\"stringValue\":\"svc\"}}]},\"scopeLogs\":[{\"scope\":{},"
+        "\"logRecords\":[{\"timeUnixNano\":\"1640995200000000000\","
+        "\"body\":{\"stringValue\":\"event-a\"}}]}],\"schemaUrl\":\"schema-a\"},{"
+        "\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"svc\"}}]},"
+        "\"scopeLogs\":[{\"scope\":{},\"logRecords\":[{\"timeUnixNano\":\"1640995201000000000\","
+        "\"body\":{\"stringValue\":\"event-b\"}}]}],\"schemaUrl\":\"schema-b\"}]}";
+
+    ret = flb_log_event_encoder_init(&encoder,
+                                     FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        return;
+    }
+
+    ret = flb_opentelemetry_logs_json_to_msgpack(&encoder,
+                                                 input_a,
+                                                 strlen(input_a),
+                                                 "log",
+                                                 &result);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(result == 0);
+
+    ret = flb_opentelemetry_logs_json_to_msgpack(&encoder,
+                                                 input_b,
+                                                 strlen(input_b),
+                                                 "log",
+                                                 &result);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(result == 0);
+    if (ret != 0 || result != 0) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    memset(&options, 0, sizeof(options));
+    options.logs_require_otel_metadata = FLB_TRUE;
+    options.logs_body_key = "log";
+
+    actual_json = flb_opentelemetry_logs_to_otlp_json(encoder.output_buffer,
+                                                      encoder.output_length,
+                                                      &options,
+                                                      &result);
+    TEST_CHECK(actual_json != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_JSON_SUCCESS);
+    if (actual_json == NULL) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    normalized_expected = test_normalize_json(expected);
+    TEST_CHECK(normalized_expected != NULL);
+    if (normalized_expected != NULL) {
+        TEST_CHECK(strcmp(normalized_expected, actual_json) == 0);
+        flb_sds_destroy(normalized_expected);
+    }
+    flb_sds_destroy(actual_json);
+
+    actual_proto = flb_opentelemetry_logs_to_otlp_proto(encoder.output_buffer,
+                                                       encoder.output_length,
+                                                       &options,
+                                                       &result);
+    TEST_CHECK(actual_proto != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_PROTO_SUCCESS);
+    if (actual_proto == NULL) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    decoded =
+        opentelemetry__proto__collector__logs__v1__export_logs_service_request__unpack(
+            NULL, flb_sds_len(actual_proto), (uint8_t *) actual_proto);
+    TEST_CHECK(decoded != NULL);
+    if (decoded != NULL) {
+        TEST_CHECK(decoded->n_resource_logs == 2);
+        TEST_CHECK(strcmp(decoded->resource_logs[0]->schema_url, "schema-a") == 0);
+        TEST_CHECK(strcmp(decoded->resource_logs[1]->schema_url, "schema-b") == 0);
+        opentelemetry__proto__collector__logs__v1__export_logs_service_request__free_unpacked(decoded,
+                                                                                               NULL);
+    }
+
+    flb_sds_destroy(actual_proto);
+    flb_log_event_encoder_destroy(&encoder);
+}
+
+void test_opentelemetry_logs_otlp_json_from_plain_logs()
+{
+    int ret;
+    int result;
+    flb_sds_t actual;
+    flb_sds_t normalized_expected;
+    struct flb_time timestamp;
+    struct flb_log_event_encoder encoder;
+    struct flb_opentelemetry_otlp_logs_options options;
+    char *expected;
+
+    expected =
+        "{\"resourceLogs\":[{\"resource\":{},\"scopeLogs\":[{\"scope\":{},"
+        "\"logRecords\":[{\"timeUnixNano\":\"1640995200000000000\","
+        "\"body\":{\"stringValue\":\"hello from dummy\"}}]}]}]}";
+
+    timestamp.tm.tv_sec = 1640995200;
+    timestamp.tm.tv_nsec = 0;
+
+    ret = flb_log_event_encoder_init(&encoder, FLB_LOG_EVENT_FORMAT_FLUENT_BIT_V2);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        return;
+    }
+
+    ret = flb_log_event_encoder_begin_record(&encoder);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    ret = flb_log_event_encoder_set_timestamp(&encoder, &timestamp);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    ret = flb_log_event_encoder_append_body_values(
+            &encoder,
+            FLB_LOG_EVENT_CSTRING_VALUE("message"),
+            FLB_LOG_EVENT_CSTRING_VALUE("hello from dummy"));
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    ret = flb_log_event_encoder_commit_record(&encoder);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    memset(&options, 0, sizeof(options));
+    options.logs_require_otel_metadata = FLB_FALSE;
+
+    actual = flb_opentelemetry_logs_to_otlp_json(encoder.output_buffer,
+                                                 encoder.output_length,
+                                                 &options,
+                                                 &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_JSON_SUCCESS);
+    if (actual == NULL) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    normalized_expected = test_normalize_json(expected);
+    TEST_CHECK(normalized_expected != NULL);
+    if (normalized_expected == NULL) {
+        flb_sds_destroy(actual);
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    TEST_CHECK(strcmp(normalized_expected, actual) == 0);
+
+    flb_sds_destroy(normalized_expected);
+    flb_sds_destroy(actual);
+    flb_log_event_encoder_destroy(&encoder);
+}
+
+void test_opentelemetry_metrics_otlp_json_roundtrip()
+{
+    int ret;
+    int result;
+    char *msgpack_buffer;
+    char *expected;
+    size_t msgpack_size;
+    flb_sds_t actual;
+    flb_sds_t normalized_expected;
+    struct cfl_list contexts;
+    struct cmt *context;
+
+    expected =
+        "{\"resourceMetrics\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\","
+        "\"value\":{\"stringValue\":\"svc\"}}]},\"scopeMetrics\":[{\"scope\":{\"name\":\"scope-a\","
+        "\"version\":\"1.0.0\"},\"metrics\":[{\"name\":\"requests_total\",\"description\":\"count\","
+        "\"unit\":\"1\",\"sum\":{\"dataPoints\":[{\"attributes\":[{\"key\":\"method\","
+        "\"value\":{\"stringValue\":\"GET\"}}],\"timeUnixNano\":\"1704067201000000000\","
+        "\"startTimeUnixNano\":\"1704067200000000000\",\"asInt\":\"42\"}],"
+        "\"aggregationTemporality\":2,\"isMonotonic\":true}}]}]}]}";
+
+    cfl_list_init(&contexts);
+
+    ret = flb_opentelemetry_metrics_json_to_cmt(&contexts,
+                                                expected,
+                                                strlen(expected));
+    TEST_CHECK(ret == 0);
+    if (ret != 0 || cfl_list_is_empty(&contexts)) {
+        destroy_metrics_context_list(&contexts);
+        return;
+    }
+
+    context = cfl_list_entry_first(&contexts, struct cmt, _head);
+    ret = cmt_encode_msgpack_create(context, &msgpack_buffer, &msgpack_size);
+    TEST_CHECK(ret == 0);
+
+    actual = flb_opentelemetry_metrics_msgpack_to_otlp_json(msgpack_buffer,
+                                                            msgpack_size,
+                                                            &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_JSON_SUCCESS);
+    if (actual == NULL) {
+        flb_free(msgpack_buffer);
+        destroy_metrics_context_list(&contexts);
+        return;
+    }
+
+    normalized_expected = test_normalize_json(expected);
+    TEST_CHECK(normalized_expected != NULL);
+    if (normalized_expected == NULL) {
+        flb_free(msgpack_buffer);
+        flb_sds_destroy(actual);
+        destroy_metrics_context_list(&contexts);
+        return;
+    }
+    TEST_CHECK(strcmp(normalized_expected, actual) == 0);
+
+    flb_free(msgpack_buffer);
+    flb_sds_destroy(normalized_expected);
+    flb_sds_destroy(actual);
+    destroy_metrics_context_list(&contexts);
+}
+
+void test_opentelemetry_traces_otlp_json_roundtrip()
+{
+    int ret;
+    int result;
+    char *msgpack_buffer;
+    char *expected;
+    size_t msgpack_size;
+    flb_sds_t actual;
+    flb_sds_t normalized_expected;
+    struct ctrace *trace_context;
+
+    expected =
+        "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\","
+        "\"value\":{\"stringValue\":\"svc\"}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"scope-a\","
+        "\"version\":\"1.0.0\"},\"spans\":[{\"traceId\":\"00112233445566778899aabbccddeeff\","
+        "\"spanId\":\"0011223344556677\",\"name\":\"op-a\",\"kind\":2,"
+        "\"startTimeUnixNano\":\"1704067200000000000\",\"endTimeUnixNano\":\"1704067201000000000\","
+        "\"attributes\":[{\"key\":\"http.method\",\"value\":{\"stringValue\":\"GET\"}}],"
+        "\"status\":{\"code\":1}}]}]}]}";
+
+    trace_context = flb_opentelemetry_json_traces_to_ctrace(expected,
+                                                            strlen(expected),
+                                                            &result);
+    TEST_CHECK(trace_context != NULL);
+    TEST_CHECK(result == 0);
+    if (trace_context == NULL || result != 0) {
+        return;
+    }
+
+    ret = ctr_encode_msgpack_create(trace_context, &msgpack_buffer, &msgpack_size);
+    TEST_CHECK(ret == 0);
+
+    actual = flb_opentelemetry_traces_msgpack_to_otlp_json(msgpack_buffer,
+                                                           msgpack_size,
+                                                           &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_JSON_SUCCESS);
+    if (actual == NULL) {
+        flb_free(msgpack_buffer);
+        ctr_destroy(trace_context);
+        return;
+    }
+
+    normalized_expected = test_normalize_json(expected);
+    TEST_CHECK(normalized_expected != NULL);
+    if (normalized_expected == NULL) {
+        flb_free(msgpack_buffer);
+        flb_sds_destroy(actual);
+        ctr_destroy(trace_context);
+        return;
+    }
+    TEST_CHECK(strcmp(normalized_expected, actual) == 0);
+
+    flb_free(msgpack_buffer);
+    flb_sds_destroy(normalized_expected);
+    flb_sds_destroy(actual);
+    ctr_destroy(trace_context);
+}
+
+void test_opentelemetry_logs_otlp_proto_from_plain_logs()
+{
+    int ret;
+    int result;
+    flb_sds_t actual;
+    struct flb_time timestamp;
+    struct flb_log_event_encoder encoder;
+    struct flb_opentelemetry_otlp_logs_options options;
+    Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest *decoded;
+    char empty_binary[] = {(char) 0xc4, 0x00};
+
+    timestamp.tm.tv_sec = 1640995200;
+    timestamp.tm.tv_nsec = 0;
+
+    ret = flb_log_event_encoder_init(&encoder, FLB_LOG_EVENT_FORMAT_FLUENT_BIT_V2);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        return;
+    }
+
+    ret = flb_log_event_encoder_begin_record(&encoder);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+    ret = flb_log_event_encoder_set_timestamp(&encoder, &timestamp);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+    ret = flb_log_event_encoder_append_body_values(
+            &encoder,
+            FLB_LOG_EVENT_CSTRING_VALUE("message"),
+            FLB_LOG_EVENT_CSTRING_VALUE("hello from dummy"),
+            FLB_LOG_EVENT_CSTRING_VALUE("empty_binary"),
+            FLB_LOG_EVENT_MSGPACK_RAW_VALUE(empty_binary,
+                                            sizeof(empty_binary)));
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+    ret = flb_log_event_encoder_commit_record(&encoder);
+    TEST_CHECK(ret == FLB_EVENT_ENCODER_SUCCESS);
+    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    memset(&options, 0, sizeof(options));
+    options.logs_require_otel_metadata = FLB_FALSE;
+    options.logs_body_key_attributes = FLB_TRUE;
+
+    actual = flb_opentelemetry_logs_to_otlp_proto(encoder.output_buffer,
+                                                  encoder.output_length,
+                                                  &options,
+                                                  &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_PROTO_SUCCESS);
+    if (actual == NULL) {
+        flb_log_event_encoder_destroy(&encoder);
+        return;
+    }
+
+    decoded =
+        opentelemetry__proto__collector__logs__v1__export_logs_service_request__unpack(
+            NULL, flb_sds_len(actual), (uint8_t *) actual);
+    TEST_CHECK(decoded != NULL);
+    if (decoded != NULL) {
+        TEST_CHECK(decoded->n_resource_logs == 1);
+        TEST_CHECK(decoded->resource_logs[0]->n_scope_logs == 1);
+        TEST_CHECK(decoded->resource_logs[0]->scope_logs[0]->n_log_records == 1);
+        TEST_CHECK(decoded->resource_logs[0]->scope_logs[0]->log_records[0]->body != NULL);
+        TEST_CHECK(decoded->resource_logs[0]->scope_logs[0]->log_records[0]->body->value_case ==
+                   OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_STRING_VALUE);
+        TEST_CHECK(strcmp(decoded->resource_logs[0]->scope_logs[0]->log_records[0]->body->string_value,
+                          "hello from dummy") == 0);
+        TEST_CHECK(decoded->resource_logs[0]->scope_logs[0]->log_records[0]->n_attributes == 1);
+        TEST_CHECK(strcmp(decoded->resource_logs[0]->scope_logs[0]->log_records[0]
+                              ->attributes[0]->key,
+                          "empty_binary") == 0);
+        TEST_CHECK(decoded->resource_logs[0]->scope_logs[0]->log_records[0]
+                       ->attributes[0]->value->value_case ==
+                   OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BYTES_VALUE);
+        TEST_CHECK(decoded->resource_logs[0]->scope_logs[0]->log_records[0]
+                       ->attributes[0]->value->bytes_value.len == 0);
+        opentelemetry__proto__collector__logs__v1__export_logs_service_request__free_unpacked(decoded,
+                                                                                               NULL);
+    }
+
+    flb_sds_destroy(actual);
+    flb_log_event_encoder_destroy(&encoder);
+}
+
+void test_opentelemetry_metrics_otlp_proto_roundtrip()
+{
+    int ret;
+    int result;
+    flb_sds_t actual;
+    char *expected;
+    struct cfl_list contexts;
+    struct cmt *context;
+    Opentelemetry__Proto__Collector__Metrics__V1__ExportMetricsServiceRequest *decoded;
+
+    expected =
+        "{\"resourceMetrics\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\","
+        "\"value\":{\"stringValue\":\"svc\"}}]},\"scopeMetrics\":[{\"scope\":{\"name\":\"scope-a\","
+        "\"version\":\"1.0.0\"},\"metrics\":[{\"name\":\"requests_total\",\"description\":\"count\","
+        "\"unit\":\"1\",\"sum\":{\"dataPoints\":[{\"attributes\":[{\"key\":\"method\","
+        "\"value\":{\"stringValue\":\"GET\"}}],\"timeUnixNano\":\"1704067201000000000\","
+        "\"startTimeUnixNano\":\"1704067200000000000\",\"asInt\":\"42\"}],"
+        "\"aggregationTemporality\":2,\"isMonotonic\":true}}]}]}]}";
+
+    cfl_list_init(&contexts);
+    ret = flb_opentelemetry_metrics_json_to_cmt(&contexts,
+                                                expected,
+                                                strlen(expected));
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        return;
+    }
+
+    context = cfl_list_entry_first(&contexts, struct cmt, _head);
+
+    actual = flb_opentelemetry_metrics_to_otlp_proto(context, &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_PROTO_SUCCESS);
+    if (actual != NULL) {
+        decoded =
+            opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__unpack(
+                NULL, flb_sds_len(actual), (uint8_t *) actual);
+        TEST_CHECK(decoded != NULL);
+        if (decoded != NULL) {
+            TEST_CHECK(decoded->n_resource_metrics > 0);
+            opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__free_unpacked(decoded,
+                                                                                                         NULL);
+        }
+        cmt_encode_opentelemetry_destroy((cfl_sds_t) actual);
+    }
+
+    destroy_metrics_context_list(&contexts);
+}
+
+void test_opentelemetry_metrics_msgpack_otlp_proto_merges_contexts()
+{
+    int ret;
+    int result;
+    size_t combined_size;
+    char *combined_buffer;
+    char *msgpack_buffer_a;
+    char *msgpack_buffer_b;
+    size_t msgpack_size_a;
+    size_t msgpack_size_b;
+    flb_sds_t actual;
+    struct cfl_list contexts;
+    struct cfl_list *head;
+    struct cmt *context;
+    const char *json =
+        "{\"resourceMetrics\":["
+        "{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"svc-a\"}}]},"
+        "\"scopeMetrics\":[{\"scope\":{\"name\":\"scope-a\",\"version\":\"1.0.0\"},"
+        "\"metrics\":[{\"name\":\"requests_total\",\"description\":\"count\",\"unit\":\"1\","
+        "\"sum\":{\"dataPoints\":[{\"attributes\":[{\"key\":\"method\",\"value\":{\"stringValue\":\"GET\"}}],"
+        "\"timeUnixNano\":\"1704067201000000000\",\"startTimeUnixNano\":\"1704067200000000000\","
+        "\"asInt\":\"42\"}],\"aggregationTemporality\":2,\"isMonotonic\":true}}]}]},"
+        "{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"svc-b\"}}]},"
+        "\"scopeMetrics\":[{\"scope\":{\"name\":\"scope-b\",\"version\":\"1.0.0\"},"
+        "\"metrics\":[{\"name\":\"latency_ms\",\"description\":\"latency\",\"unit\":\"ms\","
+        "\"gauge\":{\"dataPoints\":[{\"timeUnixNano\":\"1704067202000000000\",\"asDouble\":12.5}]}}]}]}]}";
+    Opentelemetry__Proto__Collector__Metrics__V1__ExportMetricsServiceRequest *decoded;
+
+    cfl_list_init(&contexts);
+
+    ret = flb_opentelemetry_metrics_json_to_cmt(&contexts, json, strlen(json));
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        return;
+    }
+
+    head = contexts.next;
+    context = cfl_list_entry(head, struct cmt, _head);
+    ret = cmt_encode_msgpack_create(context, &msgpack_buffer_a, &msgpack_size_a);
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        destroy_metrics_context_list(&contexts);
+        return;
+    }
+
+    head = head->next;
+    context = cfl_list_entry(head, struct cmt, _head);
+    ret = cmt_encode_msgpack_create(context, &msgpack_buffer_b, &msgpack_size_b);
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        flb_free(msgpack_buffer_a);
+        destroy_metrics_context_list(&contexts);
+        return;
+    }
+
+    combined_size = msgpack_size_a + msgpack_size_b;
+    combined_buffer = flb_malloc(combined_size);
+    TEST_CHECK(combined_buffer != NULL);
+    if (combined_buffer == NULL) {
+        flb_free(msgpack_buffer_a);
+        flb_free(msgpack_buffer_b);
+        destroy_metrics_context_list(&contexts);
+        return;
+    }
+
+    memcpy(combined_buffer, msgpack_buffer_a, msgpack_size_a);
+    memcpy(combined_buffer + msgpack_size_a, msgpack_buffer_b, msgpack_size_b);
+
+    actual = flb_opentelemetry_metrics_msgpack_to_otlp_proto(combined_buffer,
+                                                             combined_size,
+                                                             &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_PROTO_SUCCESS);
+    if (actual != NULL) {
+        decoded =
+            opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__unpack(
+                NULL, flb_sds_len(actual), (uint8_t *) actual);
+        TEST_CHECK(decoded != NULL);
+        if (decoded != NULL) {
+            TEST_CHECK(decoded->n_resource_metrics > 0);
+            TEST_CHECK(
+                opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__get_packed_size(decoded) ==
+                flb_sds_len(actual));
+            opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__free_unpacked(decoded,
+                                                                                                         NULL);
+        }
+
+        cmt_encode_opentelemetry_destroy((cfl_sds_t) actual);
+    }
+
+    flb_free(combined_buffer);
+    flb_free(msgpack_buffer_a);
+    flb_free(msgpack_buffer_b);
+    destroy_metrics_context_list(&contexts);
+}
+
+void test_opentelemetry_metrics_otlp_proto_data_point_batches()
+{
+    int index;
+    int result;
+    int ret;
+    int seen[11];
+    size_t batch_index;
+    size_t resource_index;
+    size_t scope_index;
+    size_t metric_index;
+    size_t point_index;
+    size_t total_data_points;
+    uint64_t timestamp;
+    char *label_keys[] = {"series"};
+    char *label_values[1];
+    char *series[] = {
+        "series-0", "series-1", "series-2", "series-3", "series-4", "series-5",
+        "series-6", "series-7", "series-8", "series-9", "series-10"
+    };
+    struct cmt *context;
+    struct cmt_gauge *gauge;
+    struct cmt_opentelemetry_batches *batches;
+    Opentelemetry__Proto__Metrics__V1__Metric *metric;
+    Opentelemetry__Proto__Metrics__V1__ScopeMetrics *scope;
+    Opentelemetry__Proto__Metrics__V1__ResourceMetrics *resource;
+    Opentelemetry__Proto__Metrics__V1__NumberDataPoint *point;
+    Opentelemetry__Proto__Collector__Metrics__V1__ExportMetricsServiceRequest *decoded;
+
+    memset(seen, 0, sizeof(seen));
+    context = cmt_create();
+    TEST_CHECK(context != NULL);
+    if (context == NULL) {
+        return;
+    }
+
+    gauge = cmt_gauge_create(context,
+                             "test",
+                             "batch",
+                             "value",
+                             "batching test",
+                             1,
+                             label_keys);
+    TEST_CHECK(gauge != NULL);
+    if (gauge == NULL) {
+        cmt_destroy(context);
+        return;
+    }
+
+    for (index = 0; index < 11; index++) {
+        label_values[0] = series[index];
+        ret = cmt_gauge_set(gauge,
+                            (uint64_t) index + 1,
+                            (double) index,
+                            1,
+                            label_values);
+        TEST_CHECK(ret == 0);
+    }
+
+    batches = cmt_encode_opentelemetry_create_batches(context, 4, &result);
+    TEST_CHECK(result == CMT_ENCODE_OPENTELEMETRY_SUCCESS);
+    TEST_CHECK(batches != NULL);
+    if (batches == NULL) {
+        cmt_destroy(context);
+        return;
+    }
+
+    TEST_CHECK(batches->count == 3);
+    TEST_CHECK(batches->entries[0].data_point_count == 4);
+    TEST_CHECK(batches->entries[1].data_point_count == 4);
+    TEST_CHECK(batches->entries[2].data_point_count == 3);
+
+    total_data_points = 0;
+    for (batch_index = 0; batch_index < batches->count; batch_index++) {
+        decoded =
+            opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__unpack(
+                NULL,
+                cfl_sds_len(batches->entries[batch_index].payload),
+                (uint8_t *) batches->entries[batch_index].payload);
+        TEST_CHECK(decoded != NULL);
+        if (decoded == NULL) {
+            continue;
+        }
+
+        for (resource_index = 0;
+             resource_index < decoded->n_resource_metrics;
+             resource_index++) {
+            resource = decoded->resource_metrics[resource_index];
+            for (scope_index = 0; scope_index < resource->n_scope_metrics; scope_index++) {
+                scope = resource->scope_metrics[scope_index];
+                for (metric_index = 0; metric_index < scope->n_metrics; metric_index++) {
+                    metric = scope->metrics[metric_index];
+                    TEST_CHECK(metric->data_case ==
+                               OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_GAUGE);
+                    if (metric->data_case !=
+                        OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_GAUGE) {
+                        continue;
+                    }
+
+                    for (point_index = 0;
+                         point_index < metric->gauge->n_data_points;
+                         point_index++) {
+                        point = metric->gauge->data_points[point_index];
+                        timestamp = point->time_unix_nano;
+                        TEST_CHECK(timestamp >= 1 && timestamp <= 11);
+                        if (timestamp >= 1 && timestamp <= 11) {
+                            seen[timestamp - 1]++;
+                        }
+                        total_data_points++;
+                    }
+                }
+            }
+        }
+
+        opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__free_unpacked(
+            decoded,
+            NULL);
+    }
+
+    TEST_CHECK(total_data_points == 11);
+    for (index = 0; index < 11; index++) {
+        TEST_CHECK(seen[index] == 1);
+    }
+
+    cmt_encode_opentelemetry_destroy_batches(batches);
+
+    batches = cmt_encode_opentelemetry_create_batches(context, 11, &result);
+    TEST_CHECK(result == CMT_ENCODE_OPENTELEMETRY_SUCCESS);
+    TEST_CHECK(batches != NULL);
+    if (batches != NULL) {
+        TEST_CHECK(batches->count == 1);
+        TEST_CHECK(batches->entries[0].data_point_count == 11);
+        cmt_encode_opentelemetry_destroy_batches(batches);
+    }
+
+    batches = cmt_encode_opentelemetry_create_batches(context, 0, &result);
+    TEST_CHECK(result == CMT_ENCODE_OPENTELEMETRY_SUCCESS);
+    TEST_CHECK(batches != NULL);
+    if (batches != NULL) {
+        TEST_CHECK(batches->count == 1);
+        TEST_CHECK(batches->entries[0].data_point_count == 11);
+        cmt_encode_opentelemetry_destroy_batches(batches);
+    }
+
+    cmt_destroy(context);
+
+    batches = cmt_encode_opentelemetry_split_payload("invalid", 7, 4, &result);
+    TEST_CHECK(batches == NULL);
+    TEST_CHECK(result == CMT_ENCODE_OPENTELEMETRY_INVALID_ARGUMENT_ERROR);
+}
+
+void test_opentelemetry_metrics_otlp_proto_batches_all_metric_types()
+{
+    int result;
+    int gauge_seen;
+    int sum_seen;
+    int histogram_seen;
+    int exp_histogram_seen;
+    int summary_seen;
+    int gauge_points_seen[3] = {0};
+    int sum_points_seen[3] = {0};
+    int histogram_points_seen[3] = {0};
+    int exp_histogram_points_seen[3] = {0};
+    int summary_points_seen[3] = {0};
+    size_t payload_size;
+    size_t batch_index;
+    size_t resource_index;
+    size_t scope_index;
+    size_t metric_index;
+    size_t point_index;
+    size_t data_point_index;
+    size_t total_data_points;
+    flb_sds_t payload;
+    Opentelemetry__Proto__Metrics__V1__Metric *metric;
+    Opentelemetry__Proto__Metrics__V1__NumberDataPoint *number_point;
+    Opentelemetry__Proto__Metrics__V1__HistogramDataPoint *histogram_point;
+    Opentelemetry__Proto__Metrics__V1__ExponentialHistogramDataPoint
+        *exp_histogram_point;
+    Opentelemetry__Proto__Metrics__V1__SummaryDataPoint *summary_point;
+    Opentelemetry__Proto__Metrics__V1__Metric metrics[5];
+    Opentelemetry__Proto__Metrics__V1__Metric *metric_entries[5];
+    Opentelemetry__Proto__Metrics__V1__Gauge gauge;
+    Opentelemetry__Proto__Metrics__V1__Sum sum;
+    Opentelemetry__Proto__Metrics__V1__Histogram histogram;
+    Opentelemetry__Proto__Metrics__V1__ExponentialHistogram exp_histogram;
+    Opentelemetry__Proto__Metrics__V1__Summary summary;
+    Opentelemetry__Proto__Metrics__V1__NumberDataPoint gauge_point_values[3];
+    Opentelemetry__Proto__Metrics__V1__NumberDataPoint sum_point_values[3];
+    Opentelemetry__Proto__Metrics__V1__NumberDataPoint *gauge_points[3];
+    Opentelemetry__Proto__Metrics__V1__NumberDataPoint *sum_points[3];
+    Opentelemetry__Proto__Metrics__V1__HistogramDataPoint histogram_point_values[3];
+    Opentelemetry__Proto__Metrics__V1__HistogramDataPoint *histogram_points[3];
+    Opentelemetry__Proto__Metrics__V1__ExponentialHistogramDataPoint
+        exp_histogram_point_values[3];
+    Opentelemetry__Proto__Metrics__V1__ExponentialHistogramDataPoint
+        *exp_histogram_points[3];
+    Opentelemetry__Proto__Metrics__V1__SummaryDataPoint summary_point_values[3];
+    Opentelemetry__Proto__Metrics__V1__SummaryDataPoint *summary_points[3];
+    Opentelemetry__Proto__Resource__V1__Resource resource_metadata;
+    Opentelemetry__Proto__Common__V1__InstrumentationScope scope_metadata;
+    Opentelemetry__Proto__Metrics__V1__ScopeMetrics scope;
+    Opentelemetry__Proto__Metrics__V1__ScopeMetrics *scopes[1];
+    Opentelemetry__Proto__Metrics__V1__ResourceMetrics resource;
+    Opentelemetry__Proto__Metrics__V1__ResourceMetrics *resources[1];
+    Opentelemetry__Proto__Metrics__V1__ScopeMetrics *decoded_scope;
+    Opentelemetry__Proto__Metrics__V1__ResourceMetrics *decoded_resource;
+    Opentelemetry__Proto__Collector__Metrics__V1__ExportMetricsServiceRequest request;
+    Opentelemetry__Proto__Collector__Metrics__V1__ExportMetricsServiceRequest *decoded;
+    struct cmt_opentelemetry_batches *batches;
+
+    opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__init(
+        &request);
+    opentelemetry__proto__metrics__v1__resource_metrics__init(&resource);
+    opentelemetry__proto__metrics__v1__scope_metrics__init(&scope);
+    opentelemetry__proto__metrics__v1__gauge__init(&gauge);
+    opentelemetry__proto__metrics__v1__sum__init(&sum);
+    opentelemetry__proto__metrics__v1__histogram__init(&histogram);
+    opentelemetry__proto__metrics__v1__exponential_histogram__init(&exp_histogram);
+    opentelemetry__proto__metrics__v1__summary__init(&summary);
+    opentelemetry__proto__resource__v1__resource__init(&resource_metadata);
+    opentelemetry__proto__common__v1__instrumentation_scope__init(&scope_metadata);
+
+    for (metric_index = 0; metric_index < 5; metric_index++) {
+        opentelemetry__proto__metrics__v1__metric__init(&metrics[metric_index]);
+        metric_entries[metric_index] = &metrics[metric_index];
+    }
+
+    for (point_index = 0; point_index < 3; point_index++) {
+        opentelemetry__proto__metrics__v1__number_data_point__init(
+            &gauge_point_values[point_index]);
+        opentelemetry__proto__metrics__v1__number_data_point__init(
+            &sum_point_values[point_index]);
+        opentelemetry__proto__metrics__v1__histogram_data_point__init(
+            &histogram_point_values[point_index]);
+        opentelemetry__proto__metrics__v1__exponential_histogram_data_point__init(
+            &exp_histogram_point_values[point_index]);
+        opentelemetry__proto__metrics__v1__summary_data_point__init(
+            &summary_point_values[point_index]);
+
+        gauge_points[point_index] = &gauge_point_values[point_index];
+        gauge_point_values[point_index].start_time_unix_nano = 100 + point_index;
+        gauge_point_values[point_index].time_unix_nano = 1000 + point_index;
+        gauge_point_values[point_index].flags = 1 + point_index;
+        gauge_point_values[point_index].value_case =
+            OPENTELEMETRY__PROTO__METRICS__V1__NUMBER_DATA_POINT__VALUE_AS_INT;
+        gauge_point_values[point_index].as_int = 10 + point_index;
+
+        sum_points[point_index] = &sum_point_values[point_index];
+        sum_point_values[point_index].start_time_unix_nano = 200 + point_index;
+        sum_point_values[point_index].time_unix_nano = 2000 + point_index;
+        sum_point_values[point_index].flags = 11 + point_index;
+        sum_point_values[point_index].value_case =
+            OPENTELEMETRY__PROTO__METRICS__V1__NUMBER_DATA_POINT__VALUE_AS_DOUBLE;
+        sum_point_values[point_index].as_double = 20.5 + point_index;
+
+        histogram_points[point_index] = &histogram_point_values[point_index];
+        histogram_point_values[point_index].start_time_unix_nano = 300 + point_index;
+        histogram_point_values[point_index].time_unix_nano = 3000 + point_index;
+        histogram_point_values[point_index].count = 30 + point_index;
+        histogram_point_values[point_index].has_sum = FLB_TRUE;
+        histogram_point_values[point_index].sum = 30.5 + point_index;
+        histogram_point_values[point_index].flags = 21 + point_index;
+        histogram_point_values[point_index].has_min = FLB_TRUE;
+        histogram_point_values[point_index].min = 3.5 + point_index;
+        histogram_point_values[point_index].has_max = FLB_TRUE;
+        histogram_point_values[point_index].max = 35.5 + point_index;
+
+        exp_histogram_points[point_index] = &exp_histogram_point_values[point_index];
+        exp_histogram_point_values[point_index].start_time_unix_nano = 400 + point_index;
+        exp_histogram_point_values[point_index].time_unix_nano = 4000 + point_index;
+        exp_histogram_point_values[point_index].count = 40 + point_index;
+        exp_histogram_point_values[point_index].has_sum = FLB_TRUE;
+        exp_histogram_point_values[point_index].sum = 40.5 + point_index;
+        exp_histogram_point_values[point_index].scale = 4 + point_index;
+        exp_histogram_point_values[point_index].zero_count = 40 + point_index;
+        exp_histogram_point_values[point_index].flags = 31 + point_index;
+        exp_histogram_point_values[point_index].has_min = FLB_TRUE;
+        exp_histogram_point_values[point_index].min = 4.5 + point_index;
+        exp_histogram_point_values[point_index].has_max = FLB_TRUE;
+        exp_histogram_point_values[point_index].max = 45.5 + point_index;
+        exp_histogram_point_values[point_index].zero_threshold = 0.5 + point_index;
+
+        summary_points[point_index] = &summary_point_values[point_index];
+        summary_point_values[point_index].start_time_unix_nano = 500 + point_index;
+        summary_point_values[point_index].time_unix_nano = 5000 + point_index;
+        summary_point_values[point_index].count = 50 + point_index;
+        summary_point_values[point_index].sum = 50.5 + point_index;
+        summary_point_values[point_index].flags = 41 + point_index;
+    }
+
+    gauge.n_data_points = 3;
+    gauge.data_points = gauge_points;
+    metrics[0].name = "gauge";
+    metrics[0].description = "gauge description";
+    metrics[0].unit = "gauge unit";
+    metrics[0].data_case = OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_GAUGE;
+    metrics[0].gauge = &gauge;
+
+    sum.n_data_points = 3;
+    sum.data_points = sum_points;
+    sum.aggregation_temporality =
+        OPENTELEMETRY__PROTO__METRICS__V1__AGGREGATION_TEMPORALITY__AGGREGATION_TEMPORALITY_DELTA;
+    sum.is_monotonic = FLB_TRUE;
+    metrics[1].name = "sum";
+    metrics[1].description = "sum description";
+    metrics[1].unit = "sum unit";
+    metrics[1].data_case = OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_SUM;
+    metrics[1].sum = &sum;
+
+    histogram.n_data_points = 3;
+    histogram.data_points = histogram_points;
+    histogram.aggregation_temporality =
+        OPENTELEMETRY__PROTO__METRICS__V1__AGGREGATION_TEMPORALITY__AGGREGATION_TEMPORALITY_CUMULATIVE;
+    metrics[2].name = "histogram";
+    metrics[2].description = "histogram description";
+    metrics[2].unit = "histogram unit";
+    metrics[2].data_case = OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_HISTOGRAM;
+    metrics[2].histogram = &histogram;
+
+    exp_histogram.n_data_points = 3;
+    exp_histogram.data_points = exp_histogram_points;
+    exp_histogram.aggregation_temporality =
+        OPENTELEMETRY__PROTO__METRICS__V1__AGGREGATION_TEMPORALITY__AGGREGATION_TEMPORALITY_DELTA;
+    metrics[3].name = "exponential_histogram";
+    metrics[3].description = "exponential histogram description";
+    metrics[3].unit = "exponential histogram unit";
+    metrics[3].data_case =
+        OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_EXPONENTIAL_HISTOGRAM;
+    metrics[3].exponential_histogram = &exp_histogram;
+
+    summary.n_data_points = 3;
+    summary.data_points = summary_points;
+    metrics[4].name = "summary";
+    metrics[4].description = "summary description";
+    metrics[4].unit = "summary unit";
+    metrics[4].data_case = OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_SUMMARY;
+    metrics[4].summary = &summary;
+
+    scope_metadata.name = "splitter scope";
+    scope_metadata.version = "2.0.0";
+    scope_metadata.dropped_attributes_count = 9;
+    scope.scope = &scope_metadata;
+    scope.schema_url = "https://example.com/scope/2.0.0";
+    scope.n_metrics = 5;
+    scope.metrics = metric_entries;
+    scopes[0] = &scope;
+    resource_metadata.dropped_attributes_count = 7;
+    resource.resource = &resource_metadata;
+    resource.schema_url = "https://example.com/resource/1.0.0";
+    resource.n_scope_metrics = 1;
+    resource.scope_metrics = scopes;
+    resources[0] = &resource;
+    request.n_resource_metrics = 1;
+    request.resource_metrics = resources;
+
+    payload_size =
+        opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__get_packed_size(
+            &request);
+    payload = flb_sds_create_size(payload_size);
+    TEST_CHECK(payload != NULL);
+    if (payload == NULL) {
+        return;
+    }
+
+    opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__pack(
+        &request,
+        (uint8_t *) payload);
+    flb_sds_len_set(payload, payload_size);
+
+    batches = cmt_encode_opentelemetry_split_payload(payload,
+                                                     payload_size,
+                                                     2,
+                                                     &result);
+    flb_sds_destroy(payload);
+    TEST_CHECK(result == CMT_ENCODE_OPENTELEMETRY_SUCCESS);
+    TEST_CHECK(batches != NULL);
+    if (batches == NULL) {
+        return;
+    }
+
+    TEST_CHECK(batches->count == 8);
+    for (batch_index = 0; batch_index < batches->count; batch_index++) {
+        if (batch_index < 7) {
+            TEST_CHECK(batches->entries[batch_index].data_point_count == 2);
+        }
+        else {
+            TEST_CHECK(batches->entries[batch_index].data_point_count == 1);
+        }
+    }
+
+    gauge_seen = 0;
+    sum_seen = 0;
+    histogram_seen = 0;
+    exp_histogram_seen = 0;
+    summary_seen = 0;
+    total_data_points = 0;
+
+    for (batch_index = 0; batch_index < batches->count; batch_index++) {
+        decoded =
+            opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__unpack(
+                NULL,
+                cfl_sds_len(batches->entries[batch_index].payload),
+                (uint8_t *) batches->entries[batch_index].payload);
+        TEST_CHECK(decoded != NULL);
+        if (decoded == NULL) {
+            continue;
+        }
+
+        TEST_CHECK(decoded->n_resource_metrics == 1);
+        for (resource_index = 0;
+             resource_index < decoded->n_resource_metrics;
+             resource_index++) {
+            decoded_resource = decoded->resource_metrics[resource_index];
+            TEST_CHECK(decoded_resource->resource != NULL);
+            TEST_CHECK(strcmp(decoded_resource->schema_url,
+                              "https://example.com/resource/1.0.0") == 0);
+            if (decoded_resource->resource != NULL) {
+                TEST_CHECK(decoded_resource->resource->dropped_attributes_count == 7);
+            }
+            TEST_CHECK(decoded_resource->n_scope_metrics == 1);
+
+            for (scope_index = 0;
+                 scope_index < decoded_resource->n_scope_metrics;
+                 scope_index++) {
+                decoded_scope = decoded_resource->scope_metrics[scope_index];
+                TEST_CHECK(decoded_scope->scope != NULL);
+                TEST_CHECK(strcmp(decoded_scope->schema_url,
+                                  "https://example.com/scope/2.0.0") == 0);
+                if (decoded_scope->scope != NULL) {
+                    TEST_CHECK(strcmp(decoded_scope->scope->name, "splitter scope") == 0);
+                    TEST_CHECK(strcmp(decoded_scope->scope->version, "2.0.0") == 0);
+                    TEST_CHECK(decoded_scope->scope->dropped_attributes_count == 9);
+                }
+
+                for (metric_index = 0;
+                     metric_index < decoded_scope->n_metrics;
+                     metric_index++) {
+                    metric = decoded_scope->metrics[metric_index];
+                    if (metric->data_case ==
+                        OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_GAUGE) {
+                        gauge_seen++;
+                        TEST_CHECK(strcmp(metric->name, "gauge") == 0);
+                        TEST_CHECK(strcmp(metric->description, "gauge description") == 0);
+                        TEST_CHECK(strcmp(metric->unit, "gauge unit") == 0);
+                        TEST_CHECK(metric->gauge->n_data_points > 0);
+                        TEST_CHECK(metric->gauge->n_data_points <= 2);
+                        total_data_points += metric->gauge->n_data_points;
+
+                        for (point_index = 0;
+                             point_index < metric->gauge->n_data_points;
+                             point_index++) {
+                            number_point = metric->gauge->data_points[point_index];
+                            TEST_CHECK(number_point->time_unix_nano >= 1000);
+                            TEST_CHECK(number_point->time_unix_nano < 1003);
+                            if (number_point->time_unix_nano < 1000 ||
+                                number_point->time_unix_nano >= 1003) {
+                                continue;
+                            }
+                            data_point_index = number_point->time_unix_nano - 1000;
+                            gauge_points_seen[data_point_index]++;
+                            TEST_CHECK(number_point->start_time_unix_nano ==
+                                       100 + data_point_index);
+                            TEST_CHECK(number_point->flags == 1 + data_point_index);
+                            TEST_CHECK(number_point->value_case ==
+                                OPENTELEMETRY__PROTO__METRICS__V1__NUMBER_DATA_POINT__VALUE_AS_INT);
+                            TEST_CHECK(number_point->as_int == 10 + data_point_index);
+                        }
+                    }
+                    else if (metric->data_case ==
+                             OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_SUM) {
+                        sum_seen++;
+                        TEST_CHECK(strcmp(metric->name, "sum") == 0);
+                        TEST_CHECK(strcmp(metric->description, "sum description") == 0);
+                        TEST_CHECK(strcmp(metric->unit, "sum unit") == 0);
+                        TEST_CHECK(metric->sum->aggregation_temporality ==
+                                   sum.aggregation_temporality);
+                        TEST_CHECK(metric->sum->is_monotonic == sum.is_monotonic);
+                        TEST_CHECK(metric->sum->n_data_points > 0);
+                        TEST_CHECK(metric->sum->n_data_points <= 2);
+                        total_data_points += metric->sum->n_data_points;
+
+                        for (point_index = 0;
+                             point_index < metric->sum->n_data_points;
+                             point_index++) {
+                            number_point = metric->sum->data_points[point_index];
+                            TEST_CHECK(number_point->time_unix_nano >= 2000);
+                            TEST_CHECK(number_point->time_unix_nano < 2003);
+                            if (number_point->time_unix_nano < 2000 ||
+                                number_point->time_unix_nano >= 2003) {
+                                continue;
+                            }
+                            data_point_index = number_point->time_unix_nano - 2000;
+                            sum_points_seen[data_point_index]++;
+                            TEST_CHECK(number_point->start_time_unix_nano ==
+                                       200 + data_point_index);
+                            TEST_CHECK(number_point->flags == 11 + data_point_index);
+                            TEST_CHECK(number_point->value_case ==
+                                OPENTELEMETRY__PROTO__METRICS__V1__NUMBER_DATA_POINT__VALUE_AS_DOUBLE);
+                            TEST_CHECK(number_point->as_double == 20.5 + data_point_index);
+                        }
+                    }
+                    else if (metric->data_case ==
+                             OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_HISTOGRAM) {
+                        histogram_seen++;
+                        TEST_CHECK(strcmp(metric->name, "histogram") == 0);
+                        TEST_CHECK(strcmp(metric->description, "histogram description") == 0);
+                        TEST_CHECK(strcmp(metric->unit, "histogram unit") == 0);
+                        TEST_CHECK(metric->histogram->aggregation_temporality ==
+                                   histogram.aggregation_temporality);
+                        TEST_CHECK(metric->histogram->n_data_points > 0);
+                        TEST_CHECK(metric->histogram->n_data_points <= 2);
+                        total_data_points += metric->histogram->n_data_points;
+
+                        for (point_index = 0;
+                             point_index < metric->histogram->n_data_points;
+                             point_index++) {
+                            histogram_point = metric->histogram->data_points[point_index];
+                            TEST_CHECK(histogram_point->time_unix_nano >= 3000);
+                            TEST_CHECK(histogram_point->time_unix_nano < 3003);
+                            if (histogram_point->time_unix_nano < 3000 ||
+                                histogram_point->time_unix_nano >= 3003) {
+                                continue;
+                            }
+                            data_point_index = histogram_point->time_unix_nano - 3000;
+                            histogram_points_seen[data_point_index]++;
+                            TEST_CHECK(histogram_point->start_time_unix_nano ==
+                                       300 + data_point_index);
+                            TEST_CHECK(histogram_point->count == 30 + data_point_index);
+                            TEST_CHECK(histogram_point->has_sum == FLB_TRUE);
+                            TEST_CHECK(histogram_point->sum == 30.5 + data_point_index);
+                            TEST_CHECK(histogram_point->flags == 21 + data_point_index);
+                            TEST_CHECK(histogram_point->has_min == FLB_TRUE);
+                            TEST_CHECK(histogram_point->min == 3.5 + data_point_index);
+                            TEST_CHECK(histogram_point->has_max == FLB_TRUE);
+                            TEST_CHECK(histogram_point->max == 35.5 + data_point_index);
+                        }
+                    }
+                    else if (metric->data_case ==
+                             OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_EXPONENTIAL_HISTOGRAM) {
+                        exp_histogram_seen++;
+                        TEST_CHECK(strcmp(metric->name, "exponential_histogram") == 0);
+                        TEST_CHECK(strcmp(metric->description,
+                                          "exponential histogram description") == 0);
+                        TEST_CHECK(strcmp(metric->unit,
+                                          "exponential histogram unit") == 0);
+                        TEST_CHECK(metric->exponential_histogram->aggregation_temporality ==
+                                   exp_histogram.aggregation_temporality);
+                        TEST_CHECK(metric->exponential_histogram->n_data_points > 0);
+                        TEST_CHECK(metric->exponential_histogram->n_data_points <= 2);
+                        total_data_points += metric->exponential_histogram->n_data_points;
+
+                        for (point_index = 0;
+                             point_index < metric->exponential_histogram->n_data_points;
+                             point_index++) {
+                            exp_histogram_point =
+                                metric->exponential_histogram->data_points[point_index];
+                            TEST_CHECK(exp_histogram_point->time_unix_nano >= 4000);
+                            TEST_CHECK(exp_histogram_point->time_unix_nano < 4003);
+                            if (exp_histogram_point->time_unix_nano < 4000 ||
+                                exp_histogram_point->time_unix_nano >= 4003) {
+                                continue;
+                            }
+                            data_point_index = exp_histogram_point->time_unix_nano - 4000;
+                            exp_histogram_points_seen[data_point_index]++;
+                            TEST_CHECK(exp_histogram_point->start_time_unix_nano ==
+                                       400 + data_point_index);
+                            TEST_CHECK(exp_histogram_point->count == 40 + data_point_index);
+                            TEST_CHECK(exp_histogram_point->has_sum == FLB_TRUE);
+                            TEST_CHECK(exp_histogram_point->sum == 40.5 + data_point_index);
+                            TEST_CHECK(exp_histogram_point->scale == 4 + data_point_index);
+                            TEST_CHECK(exp_histogram_point->zero_count ==
+                                       40 + data_point_index);
+                            TEST_CHECK(exp_histogram_point->flags == 31 + data_point_index);
+                            TEST_CHECK(exp_histogram_point->has_min == FLB_TRUE);
+                            TEST_CHECK(exp_histogram_point->min == 4.5 + data_point_index);
+                            TEST_CHECK(exp_histogram_point->has_max == FLB_TRUE);
+                            TEST_CHECK(exp_histogram_point->max == 45.5 + data_point_index);
+                            TEST_CHECK(exp_histogram_point->zero_threshold ==
+                                       0.5 + data_point_index);
+                        }
+                    }
+                    else if (metric->data_case ==
+                             OPENTELEMETRY__PROTO__METRICS__V1__METRIC__DATA_SUMMARY) {
+                        summary_seen++;
+                        TEST_CHECK(strcmp(metric->name, "summary") == 0);
+                        TEST_CHECK(strcmp(metric->description, "summary description") == 0);
+                        TEST_CHECK(strcmp(metric->unit, "summary unit") == 0);
+                        TEST_CHECK(metric->summary->n_data_points > 0);
+                        TEST_CHECK(metric->summary->n_data_points <= 2);
+                        total_data_points += metric->summary->n_data_points;
+
+                        for (point_index = 0;
+                             point_index < metric->summary->n_data_points;
+                             point_index++) {
+                            summary_point = metric->summary->data_points[point_index];
+                            TEST_CHECK(summary_point->time_unix_nano >= 5000);
+                            TEST_CHECK(summary_point->time_unix_nano < 5003);
+                            if (summary_point->time_unix_nano < 5000 ||
+                                summary_point->time_unix_nano >= 5003) {
+                                continue;
+                            }
+                            data_point_index = summary_point->time_unix_nano - 5000;
+                            summary_points_seen[data_point_index]++;
+                            TEST_CHECK(summary_point->start_time_unix_nano ==
+                                       500 + data_point_index);
+                            TEST_CHECK(summary_point->count == 50 + data_point_index);
+                            TEST_CHECK(summary_point->sum == 50.5 + data_point_index);
+                            TEST_CHECK(summary_point->flags == 41 + data_point_index);
+                        }
+                    }
+                }
+            }
+        }
+
+        opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__free_unpacked(
+            decoded,
+            NULL);
+    }
+
+    TEST_CHECK(total_data_points == 15);
+    TEST_CHECK(gauge_seen == 2);
+    TEST_CHECK(sum_seen == 2);
+    TEST_CHECK(histogram_seen == 2);
+    TEST_CHECK(exp_histogram_seen == 2);
+    TEST_CHECK(summary_seen == 2);
+    for (point_index = 0; point_index < 3; point_index++) {
+        TEST_CHECK(gauge_points_seen[point_index] == 1);
+        TEST_CHECK(sum_points_seen[point_index] == 1);
+        TEST_CHECK(histogram_points_seen[point_index] == 1);
+        TEST_CHECK(exp_histogram_points_seen[point_index] == 1);
+        TEST_CHECK(summary_points_seen[point_index] == 1);
+    }
+
+    cmt_encode_opentelemetry_destroy_batches(batches);
+}
+
+void test_opentelemetry_metrics_otlp_proto_batches_empty_context()
+{
+    int result;
+    struct cmt *context;
+    struct cmt_opentelemetry_batches *batches;
+
+    context = cmt_create();
+    TEST_CHECK(context != NULL);
+    if (context == NULL) {
+        return;
+    }
+
+    batches = cmt_encode_opentelemetry_create_batches(context, 4, &result);
+    TEST_CHECK(result == CMT_ENCODE_OPENTELEMETRY_SUCCESS);
+    TEST_CHECK(batches != NULL);
+    if (batches != NULL) {
+        TEST_CHECK(batches->count <= 1);
+        if (batches->count == 1) {
+            TEST_CHECK(batches->entries[0].data_point_count == 0);
+        }
+        cmt_encode_opentelemetry_destroy_batches(batches);
+    }
+
+    cmt_destroy(context);
+}
+
+void test_opentelemetry_traces_otlp_proto_roundtrip()
+{
+    int result;
+    flb_sds_t actual;
+    struct ctrace *trace_context;
+    char *expected;
+    Opentelemetry__Proto__Collector__Trace__V1__ExportTraceServiceRequest *decoded;
+
+    expected =
+        "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\","
+        "\"value\":{\"stringValue\":\"svc\"}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"scope-a\","
+        "\"version\":\"1.0.0\"},\"spans\":[{\"traceId\":\"00112233445566778899aabbccddeeff\","
+        "\"spanId\":\"0011223344556677\",\"name\":\"op-a\",\"kind\":2,"
+        "\"startTimeUnixNano\":\"1704067200000000000\",\"endTimeUnixNano\":\"1704067201000000000\""
+        "}]}]}]}";
+
+    trace_context = flb_opentelemetry_json_traces_to_ctrace(expected,
+                                                            strlen(expected),
+                                                            &result);
+    TEST_CHECK(trace_context != NULL);
+    if (trace_context == NULL) {
+        return;
+    }
+
+    actual = flb_opentelemetry_traces_to_otlp_proto(trace_context, &result);
+    TEST_CHECK(actual != NULL);
+    TEST_CHECK(result == FLB_OPENTELEMETRY_OTLP_PROTO_SUCCESS);
+    if (actual != NULL) {
+        decoded =
+            opentelemetry__proto__collector__trace__v1__export_trace_service_request__unpack(
+                NULL, flb_sds_len(actual), (uint8_t *) actual);
+        TEST_CHECK(decoded != NULL);
+        if (decoded != NULL) {
+            TEST_CHECK(decoded->n_resource_spans > 0);
+            opentelemetry__proto__collector__trace__v1__export_trace_service_request__free_unpacked(decoded,
+                                                                                                     NULL);
+        }
+        ctr_encode_opentelemetry_destroy((cfl_sds_t) actual);
+    }
+
+    ctr_destroy(trace_context);
+}
+
 /* Test list */
 TEST_LIST = {
     { "hex_to_id", test_hex_to_id },
+    { "hex_to_id_error_cases", test_hex_to_id_error_cases },
     { "convert_string_number_to_u64", test_convert_string_number_to_u64 },
     { "find_map_entry_by_key", test_find_map_entry_by_key },
     { "json_payload_get_wrapped_value", test_json_payload_get_wrapped_value },
     { "opentelemetry_cases", test_opentelemetry_cases },
+    { "opentelemetry_logs_otlp_json_roundtrip",
+      test_opentelemetry_logs_otlp_json_roundtrip },
+    { "opentelemetry_logs_otlp_json_preserves_appended_resources",
+      test_opentelemetry_logs_otlp_json_preserves_appended_resources },
+    { "opentelemetry_logs_otlp_resource_schema_url_identity",
+      test_opentelemetry_logs_otlp_resource_schema_url_identity },
+    { "opentelemetry_logs_otlp_json_from_plain_logs",
+      test_opentelemetry_logs_otlp_json_from_plain_logs },
+    { "opentelemetry_logs_otlp_proto_from_plain_logs",
+      test_opentelemetry_logs_otlp_proto_from_plain_logs },
+    { "opentelemetry_traces_cases", test_opentelemetry_traces_cases },
+    { "opentelemetry_traces_otlp_json_roundtrip",
+      test_opentelemetry_traces_otlp_json_roundtrip },
+    { "opentelemetry_traces_otlp_proto_roundtrip",
+      test_opentelemetry_traces_otlp_proto_roundtrip },
     { "trace_span_binary_sizes", test_trace_span_binary_sizes },
+    { "opentelemetry_metrics_cases", test_opentelemetry_metrics_cases },
+    { "opentelemetry_metrics_otlp_json_roundtrip",
+      test_opentelemetry_metrics_otlp_json_roundtrip },
+    { "opentelemetry_metrics_otlp_proto_roundtrip",
+      test_opentelemetry_metrics_otlp_proto_roundtrip },
+    { "opentelemetry_metrics_msgpack_otlp_proto_merges_contexts",
+      test_opentelemetry_metrics_msgpack_otlp_proto_merges_contexts },
+    { "opentelemetry_metrics_otlp_proto_data_point_batches",
+      test_opentelemetry_metrics_otlp_proto_data_point_batches },
+    { "opentelemetry_metrics_otlp_proto_batches_all_metric_types",
+      test_opentelemetry_metrics_otlp_proto_batches_all_metric_types },
+    { "opentelemetry_metrics_otlp_proto_batches_empty_context",
+      test_opentelemetry_metrics_otlp_proto_batches_empty_context },
     { 0 }
 };
-

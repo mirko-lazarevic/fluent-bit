@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@
 #include <fluent-bit/flb_env.h>
 #include <fluent-bit/flb_coro.h>
 #include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_oauth2.h>
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_io.h>
 #include <fluent-bit/flb_uri.h>
@@ -34,9 +35,11 @@
 #include <fluent-bit/flb_macros.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_plugin.h>
+#include <fluent-bit/flb_plugin_alias.h>
 #include <fluent-bit/flb_plugin_proxy.h>
 #include <fluent-bit/flb_http_client_debug.h>
 #include <fluent-bit/flb_output_thread.h>
+#include <fluent-bit/http_server/flb_http_server_config_map.h>
 #include <fluent-bit/flb_mp.h>
 #include <fluent-bit/flb_pack.h>
 
@@ -45,6 +48,10 @@ FLB_TLS_DEFINE(struct flb_out_flush_params, out_flush_params);
 /* Histogram buckets for output latency in seconds */
 static const double output_latency_buckets[] = {
     0.5, 1.0, 1.5, 2.5, 5.0, 10.0, 20.0, 30.0
+};
+
+static const double output_backpressure_wait_buckets[] = {
+    0.010, 0.050, 0.100, 0.250, 0.500, 1.0, 2.0, 5.0, 15.0, 30.0, 60.0
 };
 
 struct flb_config_map output_global_properties[] = {
@@ -98,6 +105,11 @@ struct flb_config_map output_global_properties[] = {
         0, FLB_FALSE, 0,
         "Sets whether using enterprise certstore or not on an output (Windows)"
     },
+    {
+        FLB_CONFIG_MAP_STR, "tls.windows.client_thumbprints", NULL,
+        0, FLB_FALSE, 0,
+        "Comma-separated list of certificate thumbprints (SHA1/SHA256) to trust from the Windows store (Windows)"
+    },
 
     {0}
 };
@@ -126,12 +138,9 @@ static int check_protocol(const char *prot, const char *output)
         len = strlen(output);
     }
 
-    if (strlen(prot) != len) {
-        return 0;
-    }
-
     /* Output plugin match */
-    if (strncasecmp(prot, output, len) == 0) {
+    if (strlen(prot) == (size_t) len &&
+        strncasecmp(prot, output, len) == 0) {
         return 1;
     }
 
@@ -160,6 +169,8 @@ static void flb_output_free_properties(struct flb_output_instance *ins)
 
     flb_kv_release(&ins->properties);
     flb_kv_release(&ins->net_properties);
+    flb_kv_release(&ins->http_server_properties);
+    flb_kv_release(&ins->oauth2_properties);
 
 #ifdef FLB_HAVE_TLS
     if (ins->tls_vhost) {
@@ -189,9 +200,18 @@ static void flb_output_free_properties(struct flb_output_instance *ins)
     if (ins->tls_ciphers) {
         flb_sds_destroy(ins->tls_ciphers);
     }
+    if (ins->tls_proxy_ca_path) {
+        flb_sds_destroy(ins->tls_proxy_ca_path);
+    }
+    if (ins->tls_proxy_ca_file) {
+        flb_sds_destroy(ins->tls_proxy_ca_file);
+    }
 # if defined(FLB_SYSTEM_WINDOWS)
     if (ins->tls_win_certstore_name) {
         flb_sds_destroy(ins->tls_win_certstore_name);
+    }
+    if (ins->tls_win_thumbprints) {
+        flb_sds_destroy(ins->tls_win_thumbprints);
     }
 # endif
 #endif
@@ -502,6 +522,18 @@ int flb_output_instance_destroy(struct flb_output_instance *ins)
         flb_config_map_destroy(ins->net_config_map);
     }
 
+    if (ins->http_server_config_map) {
+        flb_config_map_destroy(ins->http_server_config_map);
+    }
+
+    if (ins->http_server_config) {
+        flb_free(ins->http_server_config);
+    }
+
+    if (ins->oauth2_config_map) {
+        flb_config_map_destroy(ins->oauth2_config_map);
+    }
+
     if (ins->ch_events[0] > 0) {
         mk_event_closesocket(ins->ch_events[0]);
     }
@@ -648,17 +680,24 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
 {
     int ret = -1;
     int flags = 0;
+    size_t output_name_length;
+    const char *alias_target;
+    const char *output_name;
+    const char *separator;
     struct mk_list *head;
-    struct flb_output_plugin *plugin;
+    struct flb_output_plugin *plugin = NULL;
     struct flb_output_instance *instance = NULL;
 
     if (!output) {
         return NULL;
     }
 
+    output_name = output;
+
+    /* Prefer an exact registered plugin name over an alias with the same name. */
     mk_list_foreach(head, &config->out_plugins) {
         plugin = mk_list_entry(head, struct flb_output_plugin, _head);
-        if (!check_protocol(plugin->name, output)) {
+        if (!check_protocol(plugin->name, output_name)) {
             plugin = NULL;
             continue;
         }
@@ -667,6 +706,34 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
             return NULL;
         }
         break;
+    }
+
+    if (plugin == NULL) {
+        separator = strstr(output, "://");
+        if (separator != NULL && separator != output) {
+            output_name_length = separator - output;
+        }
+        else {
+            output_name_length = strlen(output);
+        }
+        alias_target = flb_plugin_alias_get(FLB_PLUGIN_OUTPUT, output,
+                                            output_name_length);
+        if (alias_target != NULL) {
+            output_name = alias_target;
+
+            mk_list_foreach(head, &config->out_plugins) {
+                plugin = mk_list_entry(head, struct flb_output_plugin, _head);
+                if (!check_protocol(plugin->name, output_name)) {
+                    plugin = NULL;
+                    continue;
+                }
+
+                if (public_only && plugin->flags & FLB_OUTPUT_PRIVATE) {
+                    return NULL;
+                }
+                break;
+            }
+        }
     }
 
     if (!plugin) {
@@ -679,6 +746,15 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
         flb_errno();
         return NULL;
     }
+
+    instance->http_server_config = flb_calloc(1, sizeof(struct flb_http_server_config));
+    if (!instance->http_server_config) {
+        flb_errno();
+        flb_free(instance);
+        return NULL;
+    }
+
+    flb_http_server_config_init(instance->http_server_config);
 
     /* Initialize event type, if not set, default to FLB_OUTPUT_LOGS */
     if (plugin->event_type == 0) {
@@ -706,6 +782,7 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
         if (instance->flags & FLB_OUTPUT_SYNCHRONOUS) {
             flb_task_queue_destroy(instance->singleplex_queue);
         }
+        flb_free(instance->http_server_config);
         flb_free(instance);
         return NULL;
     }
@@ -722,6 +799,7 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
             if (instance->flags & FLB_OUTPUT_SYNCHRONOUS) {
                 flb_task_queue_destroy(instance->singleplex_queue);
             }
+            flb_free(instance->http_server_config);
             flb_free(instance);
             return NULL;
         }
@@ -739,6 +817,7 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
     instance->match_regex = NULL;
 #endif
     instance->retry_limit = 1;
+    instance->retry_limit_is_set = FLB_FALSE;
     instance->host.name   = NULL;
     instance->host.address = NULL;
     instance->net_config_map = NULL;
@@ -774,15 +853,35 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
 # if defined(FLB_SYSTEM_WINDOWS)
     instance->tls_win_certstore_name = NULL;
     instance->tls_win_use_enterprise_certstore = FLB_FALSE;
+    instance->tls_win_thumbprints = NULL;
 # endif
+    instance->tls_proxy_verify          = FLB_TRUE;
+    instance->tls_proxy_verify_hostname = FLB_TRUE;
+    instance->tls_proxy_ca_path         = NULL;
+    instance->tls_proxy_ca_file         = NULL;
 #endif
 
     if (plugin->flags & FLB_OUTPUT_NET) {
-        ret = flb_net_host_set(plugin->name, &instance->host, output);
+        if (strstr(output, "://") != NULL) {
+            ret = flb_net_host_set(plugin->name, &instance->host, output);
+        }
+        else {
+            ret = flb_net_host_set(plugin->name, &instance->host, output_name);
+        }
+
         if (ret != 0) {
-            if (instance->flags & FLB_OUTPUT_SYNCHRONOUS) {
+            if ((instance->flags & FLB_OUTPUT_SYNCHRONOUS) &&
+                 instance->singleplex_queue != NULL) {
                 flb_task_queue_destroy(instance->singleplex_queue);
             }
+            if (instance->callback != NULL) {
+                flb_callback_destroy(instance->callback);
+            }
+            if (plugin->type != FLB_OUTPUT_PLUGIN_CORE &&
+                instance->context != NULL) {
+                flb_free(instance->context);
+            }
+            flb_free(instance->http_server_config);
             flb_free(instance);
             return NULL;
         }
@@ -793,6 +892,7 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
     if (instance->flags & FLB_OUTPUT_SYNCHRONOUS) {
         instance->singleplex_queue = flb_task_queue_create();
         if (!instance->singleplex_queue) {
+            flb_free(instance->http_server_config);
             flb_free(instance);
             flb_errno();
             return NULL;
@@ -801,6 +901,8 @@ struct flb_output_instance *flb_output_new(struct flb_config *config,
 
     flb_kv_init(&instance->properties);
     flb_kv_init(&instance->net_properties);
+    flb_kv_init(&instance->http_server_properties);
+    flb_kv_init(&instance->oauth2_properties);
     mk_list_init(&instance->upstreams);
     mk_list_init(&instance->flush_list);
     mk_list_init(&instance->flush_list_destroy);
@@ -896,6 +998,7 @@ int flb_output_set_property(struct flb_output_instance *ins,
         flb_sds_destroy(tmp);
     }
     else if (prop_key_check("retry_limit", k, len) == 0) {
+        ins->retry_limit_is_set = FLB_TRUE;
         if (tmp) {
             if (strcasecmp(tmp, "no_limits") == 0 ||
                 strcasecmp(tmp, "false") == 0 ||
@@ -922,6 +1025,28 @@ int flb_output_set_property(struct flb_output_instance *ins,
     }
     else if (strncasecmp("net.", k, 4) == 0 && tmp) {
         kv = flb_kv_item_create(&ins->net_properties, (char *) k, NULL);
+        if (!kv) {
+            if (tmp) {
+                flb_sds_destroy(tmp);
+            }
+            return -1;
+        }
+        kv->val = tmp;
+    }
+    else if (strncasecmp("oauth2", k, 6) == 0 && tmp) {
+        kv = flb_kv_item_create(&ins->oauth2_properties, (char *) k, NULL);
+        if (!kv) {
+            if (tmp) {
+                flb_sds_destroy(tmp);
+            }
+            return -1;
+        }
+        kv->val = tmp;
+    }
+    else if ((ins->p->flags & FLB_OUTPUT_HTTP_SERVER) != 0 &&
+             flb_http_server_property_is_allowed(k) == FLB_TRUE &&
+             tmp != NULL) {
+        kv = flb_kv_item_create(&ins->http_server_properties, (char *) k, NULL);
         if (!kv) {
             if (tmp) {
                 flb_sds_destroy(tmp);
@@ -999,6 +1124,20 @@ int flb_output_set_property(struct flb_output_instance *ins,
     else if (prop_key_check("tls.ciphers", k, len) == 0) {
         flb_utils_set_plugin_string_property("tls.ciphers", &ins->tls_ciphers, tmp);
     }
+    else if (prop_key_check("tls.proxy.verify", k, len) == 0 && tmp) {
+        ins->tls_proxy_verify = flb_utils_bool(tmp);
+        flb_sds_destroy(tmp);
+    }
+    else if (prop_key_check("tls.proxy.verify_hostname", k, len) == 0 && tmp) {
+        ins->tls_proxy_verify_hostname = flb_utils_bool(tmp);
+        flb_sds_destroy(tmp);
+    }
+    else if (prop_key_check("tls.proxy.ca_path", k, len) == 0) {
+        flb_utils_set_plugin_string_property("tls.proxy.ca_path", &ins->tls_proxy_ca_path, tmp);
+    }
+    else if (prop_key_check("tls.proxy.ca_file", k, len) == 0) {
+        flb_utils_set_plugin_string_property("tls.proxy.ca_file", &ins->tls_proxy_ca_file, tmp);
+    }
 #  if defined(FLB_SYSTEM_WINDOWS)
     else if (prop_key_check("tls.windows.certstore_name", k, len) == 0 && tmp) {
         flb_utils_set_plugin_string_property("tls.windows.certstore_name", &ins->tls_win_certstore_name, tmp);
@@ -1006,6 +1145,9 @@ int flb_output_set_property(struct flb_output_instance *ins,
     else if (prop_key_check("tls.windows.use_enterprise_store", k, len) == 0 && tmp) {
         ins->tls_win_use_enterprise_certstore = flb_utils_bool(tmp);
         flb_sds_destroy(tmp);
+    }
+    else if (prop_key_check("tls.windows.client_thumbprints", k, len) == 0 && tmp) {
+        flb_utils_set_plugin_string_property("tls.windows.client_thumbprints", &ins->tls_win_thumbprints, tmp);
     }
 #  endif
 #endif
@@ -1042,6 +1184,16 @@ int flb_output_set_property(struct flb_output_instance *ins,
          * Create the property, we don't pass the value since we will
          * map it directly to avoid an extra memory allocation.
          */
+        if (flb_config_map_property_has_dynamic_env(ins->p->config_map, k) == FLB_TRUE) {
+            if (tmp) {
+                flb_sds_destroy(tmp);
+            }
+            tmp = flb_sds_create(v);
+            if (!tmp) {
+                return -1;
+            }
+        }
+
         kv = flb_kv_item_create(&ins->properties, (char *) k, NULL);
         if (!kv) {
             if (tmp) {
@@ -1137,12 +1289,95 @@ int flb_output_net_property_check(struct flb_output_instance *ins,
     return 0;
 }
 
+int flb_output_oauth2_property_check(struct flb_output_instance *ins,
+                                      struct flb_config *config)
+{
+    int ret = 0;
+
+    /* Get OAuth2 configmap */
+    ins->oauth2_config_map = flb_oauth2_get_config_map(config);
+    if (!ins->oauth2_config_map) {
+        return -1;
+    }
+
+    /*
+     * Validate 'oauth2*' properties: if the plugin uses OAuth2,
+     * it might receive OAuth2 settings.
+     */
+    if (mk_list_size(&ins->oauth2_properties) > 0) {
+        ret = flb_config_map_properties_check(ins->p->name,
+                                              &ins->oauth2_properties,
+                                              ins->oauth2_config_map);
+        if (ret == -1) {
+            if (config->program_name) {
+                flb_helper("try the command: %s -o %s -h\n",
+                           config->program_name, ins->p->name);
+            }
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int flb_output_http_server_property_check(struct flb_output_instance *ins,
+                                                 struct flb_config *config)
+{
+    int ret = 0;
+
+    if (ins->http_server_config_map == NULL) {
+        ins->http_server_config_map = flb_http_server_get_config_map(config);
+        if (!ins->http_server_config_map) {
+            return -1;
+        }
+    }
+
+    if (mk_list_size(&ins->http_server_properties) > 0) {
+        ret = flb_config_map_properties_check(ins->p->name,
+                                              &ins->http_server_properties,
+                                              ins->http_server_config_map);
+        if (ret == -1) {
+            if (config->program_name) {
+                flb_helper("try the command: %s -o %s -h\n",
+                           config->program_name, ins->p->name);
+            }
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 int flb_output_plugin_property_check(struct flb_output_instance *ins,
                                      struct flb_config *config)
 {
     int ret = 0;
+    struct mk_list *tmp;
+    struct mk_list *head;
     struct mk_list *config_map;
+    struct flb_kv *kv;
+    struct flb_kv *moved;
     struct flb_output_plugin *p = ins->p;
+
+    if ((p->flags & FLB_OUTPUT_HTTP_SERVER) != 0) {
+        mk_list_foreach_safe(head, tmp, &ins->properties) {
+            kv = mk_list_entry(head, struct flb_kv, _head);
+
+            if (flb_http_server_property_is_allowed(kv->key) == FLB_FALSE) {
+                continue;
+            }
+
+            moved = flb_kv_item_create(&ins->http_server_properties, kv->key, NULL);
+            if (moved == NULL) {
+                return -1;
+            }
+
+            moved->val = kv->val;
+            kv->val = NULL;
+            mk_list_del(&kv->_head);
+            flb_kv_item_destroy(kv);
+        }
+    }
 
     if (p->config_map) {
         /*
@@ -1171,6 +1406,36 @@ int flb_output_plugin_property_check(struct flb_output_instance *ins,
 
     return 0;
 }
+
+#ifdef FLB_HAVE_TLS
+/* Eagerly validate tls.proxy.ca_file/ca_path so a bad path fails init here,
+ * instead of being silently ignored later in flb_output_upstream_set(). */
+int flb_output_proxy_tls_ca_check(struct flb_output_instance *ins)
+{
+    struct flb_tls *tls_proxy_validate;
+
+    if (ins->tls_proxy_ca_file == NULL && ins->tls_proxy_ca_path == NULL) {
+        return 0;
+    }
+
+    tls_proxy_validate = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                        ins->tls_proxy_verify,
+                                        0,
+                                        NULL,
+                                        ins->tls_proxy_ca_path,
+                                        ins->tls_proxy_ca_file,
+                                        NULL, NULL, NULL);
+    if (!tls_proxy_validate) {
+        flb_error("[output %s] error initializing TLS context for "
+                  "tls.proxy.ca_file/tls.proxy.ca_path",
+                  ins->name);
+        return -1;
+    }
+
+    flb_tls_destroy(tls_proxy_validate);
+    return 0;
+}
+#endif
 
 /* Trigger the output plugins setup callbacks to prepare them. */
 int flb_output_init_all(struct flb_config *config)
@@ -1342,6 +1607,22 @@ int flb_output_init_all(struct flb_config *config)
                                                 buckets,
                                                 2, (char *[]) {"input", "output"});
 
+        buckets = cmt_histogram_buckets_create_size((double *) output_backpressure_wait_buckets,
+                                                    sizeof(output_backpressure_wait_buckets) / sizeof(double));
+        if (!buckets) {
+            flb_error("could not create backpressure wait histogram buckets for %s", name);
+            flb_output_instance_destroy(ins);
+            return -1;
+        }
+
+        ins->cmt_backpressure_wait = cmt_histogram_create(ins->cmt,
+                                                "fluentbit",
+                                                "output",
+                                                "backpressure_wait_seconds",
+                                                "Output backpressure wait in seconds",
+                                                buckets,
+                                                1, (char *[]) {"output"});
+
         /* old API */
         ins->metrics = flb_metrics_create(name);
         if (ins->metrics) {
@@ -1421,6 +1702,16 @@ int flb_output_init_all(struct flb_config *config)
                 }
             }
 
+            if (ins->tls_win_thumbprints) {
+                ret = flb_tls_set_client_thumbprints(ins->tls, ins->tls_win_thumbprints);
+                if (ret == -1) {
+                    flb_error("[input %s] error set up to use thumbprints of certificates in TLS context",
+                              ins->name);
+
+                    return -1;
+                }
+            }
+
             if (ins->tls_win_certstore_name) {
                 flb_debug("[output %s] starting to load %s certstore in TLS context",
                           ins->name, ins->tls_win_certstore_name);
@@ -1443,6 +1734,11 @@ int flb_output_init_all(struct flb_config *config)
                 }
             }
 # endif
+        }
+
+        if (flb_output_proxy_tls_ca_check(ins) == -1) {
+            flb_output_instance_destroy(ins);
+            return -1;
         }
 #endif
         /*
@@ -1480,6 +1776,22 @@ int flb_output_init_all(struct flb_config *config)
         if (flb_output_net_property_check(ins, config) == -1) {
             flb_output_instance_destroy(ins);
             return -1;
+        }
+
+        /* Check OAuth2 properties if any */
+        if (mk_list_size(&ins->oauth2_properties) > 0) {
+            if (flb_output_oauth2_property_check(ins, config) == -1) {
+                flb_output_instance_destroy(ins);
+                return -1;
+            }
+        }
+
+        if ((p->flags & FLB_OUTPUT_HTTP_SERVER) != 0 ||
+            mk_list_size(&ins->http_server_properties) > 0) {
+            if (flb_output_http_server_property_check(ins, config) == -1) {
+                flb_output_instance_destroy(ins);
+                return -1;
+            }
         }
 
         /* Initialize plugin through it 'init callback' */
@@ -1641,7 +1953,30 @@ int flb_output_upstream_set(struct flb_upstream *u, struct flb_output_instance *
             flb_free(u->proxy_password);
             u->proxy_password = NULL;
         }
+
+#ifdef FLB_HAVE_TLS
+        if (u->proxy_tls_context) {
+            flb_tls_destroy(u->proxy_tls_context);
+            u->proxy_tls_context = NULL;
+        }
+#endif
     }
+
+#ifdef FLB_HAVE_TLS
+    /*
+     * If flb_upstream_create() built a proxy TLS context (HTTPS proxy in
+     * effect), reconfigure it using this instance's tls.proxy.* settings
+     * instead of the hardcoded defaults. Independent from ins->tls*
+     * (destination TLS settings) by design.
+     */
+    if (u->proxy_tls_context != NULL) {
+        flb_upstream_proxy_tls_setup(u,
+                                     ins->tls_proxy_verify,
+                                     ins->tls_proxy_verify_hostname,
+                                     ins->tls_proxy_ca_path,
+                                     ins->tls_proxy_ca_file);
+    }
+#endif
 
     return 0;
 }

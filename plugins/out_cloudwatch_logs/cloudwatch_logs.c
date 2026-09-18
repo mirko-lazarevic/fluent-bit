@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -455,9 +455,13 @@ static void cb_cloudwatch_flush(struct flb_event_chunk *event_chunk,
     }
 
     event_count = process_and_send(ctx, i_ins->p->name, buf, event_chunk->tag, event_chunk->data, event_chunk->size,
-                                   event_chunk->type);
+                                   event_chunk->type, config);
     if (event_count < 0) {
         flb_plg_error(ctx->ins, "Failed to send events");
+        if (buf->non_retriable_error == FLB_TRUE) {
+            cw_flush_destroy(buf);
+            FLB_OUTPUT_RETURN(FLB_ERROR);
+        }
         cw_flush_destroy(buf);
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }

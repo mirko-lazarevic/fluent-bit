@@ -161,6 +161,8 @@ static int in_winevtlog_init(struct flb_input_instance *in,
     struct winevtlog_config *ctx;
     struct winevtlog_session *session;
     int status = WINEVTLOG_SESSION_CREATE_OK;
+    double mult = 2.0;
+    DWORD tmp_ms = 0;
 
     /* Initialize context */
     ctx = flb_calloc(1, sizeof(struct winevtlog_config));
@@ -169,6 +171,7 @@ static int in_winevtlog_init(struct flb_input_instance *in,
         return -1;
     }
     ctx->ins = in;
+    mk_list_init(&ctx->event_templates);
 
     ctx->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
 
@@ -185,6 +188,92 @@ static int in_winevtlog_init(struct flb_input_instance *in,
         flb_log_event_encoder_destroy(ctx->log_encoder);
         flb_free(ctx);
         return -1;
+    }
+
+    /* Rendering options are mutually exclusive */
+    if (ctx->render_event_as_xml && ctx->render_event_as_text) {
+        flb_plg_error(in,
+                      "render_event_as_xml and render_event_as_text cannot be enabled at the same time");
+        flb_log_event_encoder_destroy(ctx->log_encoder);
+        flb_free(ctx);
+        return -1;
+    }
+
+    if (ctx->render_event_as_text) {
+        if (ctx->render_event_text_key == NULL || ctx->render_event_text_key[0] == '\0') {
+            flb_plg_error(in, "render_event_text_key cannot be empty when render_event_as_text is enabled");
+            flb_log_event_encoder_destroy(ctx->log_encoder);
+            flb_free(ctx);
+            return -1;
+        }
+    }
+
+    if (ctx->event_data_as_map && ctx->event_template_cache_size < 1) {
+        flb_plg_error(in,
+                      "event_template_cache_size must be greater than zero when "
+                      "event_data_as_map is enabled");
+        flb_log_event_encoder_destroy(ctx->log_encoder);
+        flb_free(ctx);
+        return -1;
+    }
+
+    if (ctx->event_data_as_map) {
+        flb_plg_debug(in,
+                      "EventData named maps enabled; template cache size=%d",
+                      ctx->event_template_cache_size);
+    }
+
+    if (ctx->backoff_multiplier_str && ctx->backoff_multiplier_str[0] != '\0') {
+        mult = atof(ctx->backoff_multiplier_str);
+        if (mult <= 0.0) {
+            flb_plg_warn(in, "invalid reconnect.multiplier='%s', fallback to 2.0",
+                         ctx->backoff_multiplier_str);
+            mult = 2.0;
+        }
+    }
+    ctx->backoff.multiplier_x1000 = (DWORD)(mult * 1000.0);
+
+    /* normalize base/max/jitter/retries to sane ranges */
+    if (ctx->backoff.base_ms <= 0) {
+        ctx->backoff.base_ms = 500;
+    }
+    if (ctx->backoff.max_ms  <= 0) {
+        ctx->backoff.max_ms  = 30000;
+    }
+    if (ctx->backoff.jitter_pct < 0) {
+        ctx->backoff.jitter_pct = 0;
+    }
+    if (ctx->backoff.max_retries < 0) {
+        ctx->backoff.max_retries = 0;
+    }
+
+    /* clamp out-of-range values, protecting against negative INT written into DWORD */
+    if (ctx->backoff.base_ms > 3600000U) { /* cap at 1 hour */
+        ctx->backoff.base_ms = 3600000U;
+    }
+    if (ctx->backoff.max_ms > 86400000U) { /* cap at 24 hours */
+        ctx->backoff.max_ms = 86400000U;
+    }
+    if (ctx->backoff.jitter_pct > 100U) {  /* jitter as percentage */
+        ctx->backoff.jitter_pct = 100U;
+    }
+    if ((unsigned) ctx->backoff.max_retries > 100U) { /* cap retries */
+        ctx->backoff.max_retries = 100;
+    }
+    /* ensure ordering */
+    if (ctx->backoff.max_ms < ctx->backoff.base_ms) {
+        flb_plg_warn(in, "reconnect.max_ms < reconnect.base_ms, swapping values");
+        tmp_ms = ctx->backoff.base_ms;
+        ctx->backoff.base_ms = ctx->backoff.max_ms;
+        ctx->backoff.max_ms  = tmp_ms;
+    }
+
+    if (ctx->backoff.multiplier_x1000 < 500)  {
+        ctx->backoff.multiplier_x1000 = 500;
+    }
+
+    if (ctx->backoff.multiplier_x1000 > 10000) {
+        ctx->backoff.multiplier_x1000 = 10000;
     }
 
     /* Initialize session context */
@@ -278,6 +367,26 @@ static int in_winevtlog_init(struct flb_input_instance *in,
         }
     }
 
+    if (ctx->event_data_as_map) {
+        ctx->event_template_cache = flb_hash_table_create(
+                FLB_HASH_TABLE_EVICT_NONE,
+                (size_t) ctx->event_template_cache_size,
+                ctx->event_template_cache_size);
+        if (ctx->event_template_cache == NULL) {
+            flb_plg_error(ctx->ins, "could not create the event template cache");
+            if (ctx->db) {
+                flb_sqldb_close(ctx->db);
+            }
+            winevtlog_close_all(ctx->active_channel);
+            if (ctx->session) {
+                in_winevtlog_session_destroy(ctx->session);
+            }
+            flb_log_event_encoder_destroy(ctx->log_encoder);
+            flb_free(ctx);
+            return -1;
+        }
+    }
+
     /* Set the context */
     flb_input_set_context(in, ctx);
 
@@ -335,6 +444,10 @@ static int in_winevtlog_collect(struct flb_input_instance *ins,
     struct mk_list *head;
     struct winevtlog_channel *ch;
 
+    if (!ctx->active_channel) {
+        return 0;
+    }
+
     mk_list_foreach(head, ctx->active_channel) {
         ch = mk_list_entry(head, struct winevtlog_channel, _head);
         in_winevtlog_read_channel(ins, ctx, ch);
@@ -370,6 +483,7 @@ static int in_winevtlog_exit(void *data, struct flb_config *config)
     if (ctx->session) {
         in_winevtlog_session_destroy(ctx->session);
     }
+    winevtlog_event_template_cache_destroy(ctx);
     flb_free(ctx);
 
     return 0;
@@ -402,6 +516,16 @@ static struct flb_config_map config_map[] = {
       "Whether to include StringInserts in output records"
     },
     {
+      FLB_CONFIG_MAP_BOOL, "event_data_as_map", "false",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, event_data_as_map),
+      "Emit EventData as a named map using provider metadata instead of StringInserts"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "event_template_cache_size", "256",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, event_template_cache_size),
+      "Maximum number of provider event templates cached for event_data_as_map"
+    },
+    {
       FLB_CONFIG_MAP_BOOL, "read_existing_events", "false",
       0, FLB_TRUE, offsetof(struct winevtlog_config, read_existing_events),
       "Whether to consume at oldest records in channels"
@@ -409,7 +533,17 @@ static struct flb_config_map config_map[] = {
     {
       FLB_CONFIG_MAP_BOOL, "render_event_as_xml", "false",
       0, FLB_TRUE, offsetof(struct winevtlog_config, render_event_as_xml),
-      "Whether to consume at oldest records in channels"
+      "Render Windows EventLog as XML (System and Message fields)"
+    },
+    {
+      FLB_CONFIG_MAP_BOOL, "render_event_as_text", "false",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, render_event_as_text),
+      "Render Windows EventLog as newline-separated key=value text"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "render_event_text_key", "log",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, render_event_text_key),
+      "Record key name used when render_event_as_text is enabled"
     },
     {
       FLB_CONFIG_MAP_BOOL, "use_ansi", "false",
@@ -450,6 +584,32 @@ static struct flb_config_map config_map[] = {
       FLB_CONFIG_MAP_STR, "remote.password", (char *)NULL,
       0, FLB_TRUE, offsetof(struct winevtlog_config, remote_password),
       "Specify password of remote access for Windows EventLog"
+    },
+    /* ---- reconnect backoff parameters ---- */
+    {
+      FLB_CONFIG_MAP_INT, "reconnect.base_ms", "500",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, backoff.base_ms),
+      "Initial reconnect backoff in milliseconds"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "reconnect.max_ms", "30000",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, backoff.max_ms),
+      "Maximum reconnect backoff in milliseconds"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "reconnect.multiplier", "2.0",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, backoff_multiplier_str),
+      "Exponential backoff multiplier (float, e.g. 2.0)"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "reconnect.jitter_pct", "20",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, backoff.jitter_pct),
+      "Jitter percentage applied to backoff (e.g. 20 means ±20%)"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "reconnect.max_retries", "8",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, backoff.max_retries),
+      "Max reconnect attempts before giving up"
     },
     /* EOF */
     {0}

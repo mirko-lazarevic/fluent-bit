@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,15 +18,87 @@
  */
 
 #include <fluent-bit/flb_input_plugin.h>
+#include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_log_event_encoder.h>
+#include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_opentelemetry.h>
 #include <fluent-otel-proto/fluent-otel.h>
 
+#include <cfl/cfl_arena.h>
 
 #include "opentelemetry.h"
 #include "opentelemetry_utils.h"
+
+/*
+ * Small requests use protobuf-c's default allocator to avoid reserving an
+ * arena chunk. Realistic batched requests use the arena to amortize the large
+ * number of short-lived allocations performed by protobuf-c.
+ */
+#define OTEL_PROTOBUF_ARENA_MIN_PAYLOAD_SIZE 8192
+#define OTEL_PROTOBUF_ARENA_INITIAL_CHUNK_SIZE 4096
+#define OTEL_PROTOBUF_ARENA_MAX_CHUNK_SIZE 65536
+
+static void *protobuf_arena_chunk_malloc(void *context, size_t size)
+{
+    (void) context;
+
+    return flb_malloc(size);
+}
+
+static void protobuf_arena_chunk_free(void *context, void *pointer)
+{
+    (void) context;
+
+    flb_free(pointer);
+}
+
+static void *protobuf_arena_alloc(void *allocator_data, size_t size)
+{
+    struct cfl_arena *arena;
+
+    arena = allocator_data;
+    if (size == 0) {
+        size = 1;
+    }
+
+    return cfl_arena_malloc(arena, size);
+}
+
+static void protobuf_arena_free(void *allocator_data, void *pointer)
+{
+    (void) allocator_data;
+    (void) pointer;
+}
+
+static struct cfl_arena *protobuf_arena_create(void)
+{
+    struct cfl_arena_options options;
+
+    cfl_arena_options_init(&options);
+    options.chunk_size = OTEL_PROTOBUF_ARENA_INITIAL_CHUNK_SIZE;
+    options.maximum_chunk_size = OTEL_PROTOBUF_ARENA_MAX_CHUNK_SIZE;
+    options.malloc_fn = protobuf_arena_chunk_malloc;
+    options.free_fn = protobuf_arena_chunk_free;
+
+    return cfl_arena_create_with_options(&options);
+}
+
+static Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest *
+protobuf_logs_unpack(ProtobufCAllocator *allocator, size_t size, const uint8_t *data)
+{
+    return opentelemetry__proto__collector__logs__v1__export_logs_service_request__unpack(
+        allocator, size, data);
+}
+
+static void protobuf_logs_free(
+    Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest *logs,
+    ProtobufCAllocator *allocator)
+{
+    opentelemetry__proto__collector__logs__v1__export_logs_service_request__free_unpacked(
+        logs, allocator);
+}
 
 /*
  * OTLP encoding functions to pack the log records as msgpack
@@ -49,7 +121,7 @@ static int otel_pack_bool(msgpack_packer *mp_pck, bool val)
     }
 }
 
-static int otel_pack_int(msgpack_packer *mp_pck, int val)
+static int otel_pack_int(msgpack_packer *mp_pck, int64_t val)
 {
     return msgpack_pack_int64(mp_pck, val);
 }
@@ -152,6 +224,11 @@ static int otlp_pack_any_value(msgpack_packer *mp_pck,
             result = otel_pack_string(mp_pck, body->string_value);
             break;
 
+        case OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_STRING_VALUE_STRINDEX:
+            /* Profiling-only string dictionary reference: ignore in logs. */
+            result = msgpack_pack_nil(mp_pck);
+            break;
+
         case OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_BOOL_VALUE:
             result =  otel_pack_bool(mp_pck, body->bool_value);
             break;
@@ -217,10 +294,12 @@ static int otel_pack_v1_metadata(struct flb_opentelemetry *ctx,
 
     flb_mp_map_header_init(&mh, mp_pck);
 
-    flb_mp_map_header_append(&mh);
-    msgpack_pack_str(mp_pck, 18);
-    msgpack_pack_str_body(mp_pck, "observed_timestamp", 18);
-    msgpack_pack_uint64(mp_pck, log_record->observed_time_unix_nano);
+    if (log_record->observed_time_unix_nano != 0) {
+        flb_mp_map_header_append(&mh);
+        msgpack_pack_str(mp_pck, 18);
+        msgpack_pack_str_body(mp_pck, "observed_timestamp", 18);
+        msgpack_pack_uint64(mp_pck, log_record->observed_time_unix_nano);
+    }
 
     /* Value of 0 indicates unknown or missing timestamp. */
     if (log_record->time_unix_nano != 0) {
@@ -258,6 +337,13 @@ static int otel_pack_v1_metadata(struct flb_opentelemetry *ctx,
         }
     }
 
+    if (log_record->dropped_attributes_count > 0) {
+        flb_mp_map_header_append(&mh);
+        msgpack_pack_str(mp_pck, 24);
+        msgpack_pack_str_body(mp_pck, "dropped_attributes_count", 24);
+        msgpack_pack_uint64(mp_pck, log_record->dropped_attributes_count);
+    }
+
     if (log_record->trace_id.len > 0) {
         flb_mp_map_header_append(&mh);
         msgpack_pack_str(mp_pck, 8);
@@ -283,6 +369,14 @@ static int otel_pack_v1_metadata(struct flb_opentelemetry *ctx,
     msgpack_pack_str_body(mp_pck, "trace_flags", 11);
     msgpack_pack_uint8(mp_pck, (uint8_t) log_record->flags & 0xff);
 
+    if (log_record->event_name != NULL && strlen(log_record->event_name) > 0) {
+        flb_mp_map_header_append(&mh);
+        msgpack_pack_str(mp_pck, 10);
+        msgpack_pack_str_body(mp_pck, "event_name", 10);
+        msgpack_pack_str(mp_pck, strlen(log_record->event_name));
+        msgpack_pack_str_body(mp_pck, log_record->event_name, strlen(log_record->event_name));
+    }
+
     flb_mp_map_header_end(&mh);
 
     /* otlp key end */
@@ -295,25 +389,25 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
                                      struct flb_log_event_encoder *encoder,
                                      char *tag, size_t tag_len,
                                      uint8_t *in_buf,
-                                     size_t in_size)
+                                     size_t in_size,
+                                     size_t *record_count)
 {
-    int ret;
+    int ret = 0;
     int len;
     int resource_logs_index;
     int scope_log_index;
     int log_record_index;
     char *logs_body_key;
+    int scope_has_schema_url;
+    struct cfl_arena *protobuf_arena;
     struct flb_mp_map_header mh;
     struct flb_mp_map_header mh_tmp;
     struct flb_time tm;
+    ProtobufCAllocator arena_allocator;
+    ProtobufCAllocator *protobuf_allocator;
 
-    /* record buffer and packer */
-    msgpack_sbuffer mp_sbuf;
-    msgpack_packer  mp_pck;
-
-    /* metadata buffer and packer */
-    msgpack_sbuffer mp_sbuf_meta;
-    msgpack_packer  mp_pck_meta;
+    msgpack_packer *mp_pck;
+    msgpack_packer *mp_pck_meta;
 
     /* OTel proto suff */
     Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest *input_logs;
@@ -326,15 +420,25 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
     Opentelemetry__Proto__Logs__V1__LogRecord **log_records;
     Opentelemetry__Proto__Resource__V1__Resource *resource;
 
-    /* initialize msgpack buffers */
-    msgpack_sbuffer_init(&mp_sbuf);
-    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
+    mp_pck = &encoder->body.packer;
+    mp_pck_meta = &encoder->metadata.packer;
+    input_logs = NULL;
+    protobuf_arena = NULL;
+    protobuf_allocator = NULL;
+    *record_count = 0;
 
-    msgpack_sbuffer_init(&mp_sbuf_meta);
-    msgpack_packer_init(&mp_pck_meta, &mp_sbuf_meta, msgpack_sbuffer_write);
+    if (in_size >= OTEL_PROTOBUF_ARENA_MIN_PAYLOAD_SIZE) {
+        protobuf_arena = protobuf_arena_create();
+        if (protobuf_arena != NULL) {
+            arena_allocator.alloc = protobuf_arena_alloc;
+            arena_allocator.free = protobuf_arena_free;
+            arena_allocator.allocator_data = protobuf_arena;
+            protobuf_allocator = &arena_allocator;
+        }
+    }
 
     /* unpack logs from protobuf payload */
-    input_logs = opentelemetry__proto__collector__logs__v1__export_logs_service_request__unpack(NULL, in_size, in_buf);
+    input_logs = protobuf_logs_unpack(protobuf_allocator, in_size, in_buf);
     if (input_logs == NULL) {
         flb_plg_warn(ctx->ins, "failed to unpack input logs from OpenTelemetry payload");
         ret = -1;
@@ -342,6 +446,11 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
     }
 
     resource_logs = input_logs->resource_logs;
+    if (input_logs->n_resource_logs == 0) {
+        ret = 0;
+        goto binary_payload_to_msgpack_end;
+    }
+
     if (resource_logs == NULL) {
         flb_plg_warn(ctx->ins, "no resource logs found");
         ret = -1;
@@ -350,6 +459,11 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
 
     for (resource_logs_index = 0; resource_logs_index < input_logs->n_resource_logs; resource_logs_index++) {
         resource_log = resource_logs[resource_logs_index];
+        if (resource_log == NULL) {
+            flb_plg_warn(ctx->ins, "null resource logs entry found");
+            ret = -1;
+            goto binary_payload_to_msgpack_end;
+        }
 
         resource = resource_log->resource;
         scope_logs = resource_log->scope_logs;
@@ -362,7 +476,17 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
 
         for (scope_log_index = 0; scope_log_index < resource_log->n_scope_logs; scope_log_index++) {
             scope_log = scope_logs[scope_log_index];
+            if (scope_log == NULL) {
+                flb_plg_warn(ctx->ins, "null scope logs entry found");
+                ret = -1;
+                goto binary_payload_to_msgpack_end;
+            }
+
             log_records = scope_log->log_records;
+
+            if (scope_log->n_log_records == 0) {
+                continue;
+            }
 
             if (log_records == NULL) {
                 flb_plg_warn(ctx->ins, "no log records found");
@@ -382,196 +506,251 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
                                                                FLB_LOG_EVENT_INT64_VALUE(scope_log_index));
 
 
-            flb_mp_map_header_init(&mh, &mp_pck);
+            ret = flb_log_event_encoder_dynamic_field_reset(&encoder->body);
+            if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+                flb_plg_error(ctx->ins, "failed to reset log event body: %s",
+                              flb_log_event_encoder_get_error_description(ret));
+                goto binary_payload_to_msgpack_end;
+            }
+
+            flb_mp_map_header_init(&mh, mp_pck);
 
             /* Resource */
             flb_mp_map_header_append(&mh);
-            msgpack_pack_str(&mp_pck, 8);
-            msgpack_pack_str_body(&mp_pck, "resource", 8);
+            msgpack_pack_str(mp_pck, 8);
+            msgpack_pack_str_body(mp_pck, "resource", 8);
 
-            flb_mp_map_header_init(&mh_tmp, &mp_pck);
+            flb_mp_map_header_init(&mh_tmp, mp_pck);
             if (resource) {
                 /* look for OTel resource attributes */
                 if (resource->n_attributes > 0 && resource->attributes) {
                     flb_mp_map_header_append(&mh_tmp);
-                    msgpack_pack_str(&mp_pck, 10);
-                    msgpack_pack_str_body(&mp_pck, "attributes", 10);
+                    msgpack_pack_str(mp_pck, 10);
+                    msgpack_pack_str_body(mp_pck, "attributes", 10);
 
-                    ret = otel_pack_kvarray(&mp_pck,
+                    ret = otel_pack_kvarray(mp_pck,
                                             resource->attributes,
                                             resource->n_attributes);
                     if (ret != 0) {
-                        return ret;
+                        goto binary_payload_to_msgpack_end;
                     }
                 }
 
                 if (resource->dropped_attributes_count > 0) {
                     flb_mp_map_header_append(&mh_tmp);
-                    msgpack_pack_str(&mp_pck, 24);
-                    msgpack_pack_str_body(&mp_pck, "dropped_attributes_count", 24);
-                    msgpack_pack_uint64(&mp_pck, resource->dropped_attributes_count);
+                    msgpack_pack_str(mp_pck, 24);
+                    msgpack_pack_str_body(mp_pck, "dropped_attributes_count", 24);
+                    msgpack_pack_uint64(mp_pck, resource->dropped_attributes_count);
                 }
 
                 if (resource_log->schema_url) {
                     flb_mp_map_header_append(&mh_tmp);
-                    msgpack_pack_str(&mp_pck, 10);
-                    msgpack_pack_str_body(&mp_pck, "schema_url", 10);
+                    msgpack_pack_str(mp_pck, 10);
+                    msgpack_pack_str_body(mp_pck, "schema_url", 10);
 
                     len = strlen(resource_log->schema_url);
-                    msgpack_pack_str(&mp_pck, len);
-                    msgpack_pack_str_body(&mp_pck, resource_log->schema_url, len);
+                    msgpack_pack_str(mp_pck, len);
+                    msgpack_pack_str_body(mp_pck, resource_log->schema_url, len);
                 }
             }
             flb_mp_map_header_end(&mh_tmp);
 
             /* scope */
             flb_mp_map_header_append(&mh);
-            msgpack_pack_str(&mp_pck, 5);
-            msgpack_pack_str_body(&mp_pck, "scope", 5);
+            msgpack_pack_str(mp_pck, 5);
+            msgpack_pack_str_body(mp_pck, "scope", 5);
 
             /* Scope */
             scope = scope_log->scope;
+            scope_has_schema_url = FLB_FALSE;
 
-            if (scope && (scope->name || scope->version || scope->n_attributes > 0)) {
-                flb_mp_map_header_init(&mh_tmp, &mp_pck);
+            if (scope_log->schema_url && strlen(scope_log->schema_url) > 0) {
+                scope_has_schema_url = FLB_TRUE;
+            }
 
-                if (scope_log->schema_url && strlen(scope_log->schema_url) > 0) {
+            if (scope && (scope->name || scope->version ||
+                          scope->n_attributes > 0 || scope->dropped_attributes_count > 0 ||
+                          scope_has_schema_url == FLB_TRUE)) {
+                flb_mp_map_header_init(&mh_tmp, mp_pck);
+
+                if (scope_has_schema_url == FLB_TRUE) {
                     flb_mp_map_header_append(&mh_tmp);
-                    msgpack_pack_str(&mp_pck, 10);
-                    msgpack_pack_str_body(&mp_pck, "schema_url", 10);
+                    msgpack_pack_str(mp_pck, 10);
+                    msgpack_pack_str_body(mp_pck, "schema_url", 10);
 
                     len = strlen(scope_log->schema_url);
-                    msgpack_pack_str(&mp_pck, len);
-                    msgpack_pack_str_body(&mp_pck, scope_log->schema_url, len);
+                    msgpack_pack_str(mp_pck, len);
+                    msgpack_pack_str_body(mp_pck, scope_log->schema_url, len);
                 }
 
                 if (scope->name && strlen(scope->name) > 0) {
                     flb_mp_map_header_append(&mh_tmp);
-                    msgpack_pack_str(&mp_pck, 4);
-                    msgpack_pack_str_body(&mp_pck, "name", 4);
+                    msgpack_pack_str(mp_pck, 4);
+                    msgpack_pack_str_body(mp_pck, "name", 4);
 
                     len = strlen(scope->name);
-                    msgpack_pack_str(&mp_pck, len);
-                    msgpack_pack_str_body(&mp_pck, scope->name, len);
+                    msgpack_pack_str(mp_pck, len);
+                    msgpack_pack_str_body(mp_pck, scope->name, len);
                 }
                 if (scope->version && strlen(scope->version) > 0) {
                     flb_mp_map_header_append(&mh_tmp);
 
-                    msgpack_pack_str(&mp_pck, 7);
-                    msgpack_pack_str_body(&mp_pck, "version", 7);
+                    msgpack_pack_str(mp_pck, 7);
+                    msgpack_pack_str_body(mp_pck, "version", 7);
 
                     len = strlen(scope->version);
-                    msgpack_pack_str(&mp_pck, len);
-                    msgpack_pack_str_body(&mp_pck, scope->version, len);
+                    msgpack_pack_str(mp_pck, len);
+                    msgpack_pack_str_body(mp_pck, scope->version, len);
                 }
 
                 if (scope->n_attributes > 0 && scope->attributes) {
                     flb_mp_map_header_append(&mh_tmp);
-                    msgpack_pack_str(&mp_pck, 10);
-                    msgpack_pack_str_body(&mp_pck, "attributes", 10);
-                    ret = otel_pack_kvarray(&mp_pck,
+                    msgpack_pack_str(mp_pck, 10);
+                    msgpack_pack_str_body(mp_pck, "attributes", 10);
+                    ret = otel_pack_kvarray(mp_pck,
                                             scope->attributes,
                                             scope->n_attributes);
                     if (ret != 0) {
-                        return ret;
+                        goto binary_payload_to_msgpack_end;
                     }
                 }
 
                 if (scope->dropped_attributes_count > 0) {
                     flb_mp_map_header_append(&mh_tmp);
-                    msgpack_pack_str(&mp_pck, 24);
-                    msgpack_pack_str_body(&mp_pck, "dropped_attributes_count", 24);
-                    msgpack_pack_uint64(&mp_pck, scope->dropped_attributes_count);
+                    msgpack_pack_str(mp_pck, 24);
+                    msgpack_pack_str_body(mp_pck, "dropped_attributes_count", 24);
+                    msgpack_pack_uint64(mp_pck, scope->dropped_attributes_count);
                 }
 
                 flb_mp_map_header_end(&mh_tmp);
             }
             else {
-                /* set an empty scope */
-                msgpack_pack_map(&mp_pck, 0);
+                flb_mp_map_header_init(&mh_tmp, mp_pck);
+
+                if (scope_has_schema_url == FLB_TRUE) {
+                    flb_mp_map_header_append(&mh_tmp);
+                    msgpack_pack_str(mp_pck, 10);
+                    msgpack_pack_str_body(mp_pck, "schema_url", 10);
+
+                    len = strlen(scope_log->schema_url);
+                    msgpack_pack_str(mp_pck, len);
+                    msgpack_pack_str_body(mp_pck, scope_log->schema_url, len);
+                }
+
+                flb_mp_map_header_end(&mh_tmp);
             }
 
             flb_mp_map_header_end(&mh);
 
-            ret = flb_log_event_encoder_set_body_from_raw_msgpack(
-                            encoder,
-                            mp_sbuf.data,
-                            mp_sbuf.size);
+            ret = flb_log_event_encoder_dynamic_field_flush(&encoder->body);
             if (ret != FLB_EVENT_ENCODER_SUCCESS) {
-                flb_plg_error(ctx->ins, "could not set group content metadata");
+                flb_plg_error(ctx->ins, "could not set group content metadata: %s",
+                              flb_log_event_encoder_get_error_description(ret));
                 goto binary_payload_to_msgpack_end;
             }
 
             flb_log_event_encoder_group_header_end(encoder);
-
-            msgpack_sbuffer_clear(&mp_sbuf);
 
             for (log_record_index=0; log_record_index < scope_log->n_log_records; log_record_index++) {
                 ret = flb_log_event_encoder_begin_record(encoder);
 
                 if (ret == FLB_EVENT_ENCODER_SUCCESS) {
                     if (log_records[log_record_index]->time_unix_nano > 0) {
-                        flb_time_from_uint64(&tm, log_records[log_record_index]->time_unix_nano);
-                        ret = flb_log_event_encoder_set_timestamp(encoder, &tm);
+                        ret = flb_time_from_uint64(
+                                &tm,
+                                log_records[log_record_index]->time_unix_nano);
+                        if (ret == 0) {
+                            ret = flb_log_event_encoder_set_timestamp(encoder, &tm);
+                        }
+                    }
+                    else if (log_records[log_record_index]->observed_time_unix_nano > 0) {
+                        ret = flb_time_from_uint64(
+                                &tm,
+                                log_records[log_record_index]->observed_time_unix_nano);
+                        if (ret == 0) {
+                            ret = flb_log_event_encoder_set_timestamp(encoder, &tm);
+                        }
                     }
                     else {
-                        ret = flb_log_event_encoder_set_current_timestamp(encoder);
+                        flb_time_get(&tm);
+                        ret = flb_log_event_encoder_set_timestamp(encoder, &tm);
                     }
                 }
 
                 if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-                     msgpack_sbuffer_clear(&mp_sbuf_meta);
-                     ret = otel_pack_v1_metadata(ctx, &mp_pck_meta, log_records[log_record_index], resource, scope_log->scope);
-                     if (ret != 0) {
+                    ret = flb_log_event_encoder_dynamic_field_reset(&encoder->metadata);
+                    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+                        flb_plg_error(ctx->ins, "failed to reset log event metadata: %s",
+                                      flb_log_event_encoder_get_error_description(ret));
+                        ret = FLB_EVENT_ENCODER_ERROR_SERIALIZATION_FAILURE;
+                    }
+                    else {
+                        ret = otel_pack_v1_metadata(ctx,
+                                                    mp_pck_meta,
+                                                    log_records[log_record_index],
+                                                    resource,
+                                                    scope_log->scope);
+                    }
+
+                    if (ret != 0) {
                         flb_plg_error(ctx->ins, "failed to convert log record");
                         ret = FLB_EVENT_ENCODER_ERROR_SERIALIZATION_FAILURE;
                     }
                     else {
-                        ret = flb_log_event_encoder_set_metadata_from_raw_msgpack(
-                                encoder,
-                                mp_sbuf_meta.data,
-                                mp_sbuf_meta.size);
+                        ret = flb_log_event_encoder_dynamic_field_flush(&encoder->metadata);
                     }
-
-                    msgpack_sbuffer_clear(&mp_sbuf_meta);
                 }
 
                 if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-                    ret = otlp_pack_any_value(
-                            &mp_pck,
-                            log_records[log_record_index]->body);
+                    ret = flb_log_event_encoder_dynamic_field_reset(&encoder->body);
+                    if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+                        flb_plg_error(ctx->ins, "failed to reset log event body: %s",
+                                      flb_log_event_encoder_get_error_description(ret));
+                        ret = FLB_EVENT_ENCODER_ERROR_SERIALIZATION_FAILURE;
+                    }
+                    else if (ctx->logs_body_key == NULL &&
+                             log_records[log_record_index]->body != NULL &&
+                             log_records[log_record_index]->body->value_case ==
+                             OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_KVLIST_VALUE) {
+                        ret = otlp_pack_any_value(
+                                mp_pck,
+                                log_records[log_record_index]->body);
+                    }
+                    else {
+                        logs_body_key = ctx->logs_body_key;
+                        if (logs_body_key == NULL) {
+                            logs_body_key = "log";
+                        }
+                        ret = msgpack_pack_map(mp_pck, 1);
+                        if (ret == 0) {
+                            ret = msgpack_pack_str(mp_pck, strlen(logs_body_key));
+                        }
+                        if (ret == 0) {
+                            ret = msgpack_pack_str_body(mp_pck,
+                                                        logs_body_key,
+                                                        strlen(logs_body_key));
+                        }
+                        if (ret == 0) {
+                            ret = otlp_pack_any_value(
+                                    mp_pck,
+                                    log_records[log_record_index]->body);
+                        }
+                    }
 
                     if (ret != 0) {
                         flb_plg_error(ctx->ins, "failed to convert log record body");
                         ret = FLB_EVENT_ENCODER_ERROR_SERIALIZATION_FAILURE;
                     }
                     else {
-                        if (ctx->logs_body_key == NULL &&
-                            log_records[log_record_index]->body != NULL &&
-                            log_records[log_record_index]->body->value_case ==
-                            OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_KVLIST_VALUE) {
-                            ret = flb_log_event_encoder_set_body_from_raw_msgpack(
-                                    encoder,
-                                    mp_sbuf.data,
-                                    mp_sbuf.size);
-                        }
-                        else {
-                            logs_body_key = ctx->logs_body_key;
-                            if (logs_body_key == NULL) {
-                                logs_body_key = "log";
-                            }
-                            ret = flb_log_event_encoder_append_body_values(
-                                    encoder,
-                                    FLB_LOG_EVENT_CSTRING_VALUE(logs_body_key),
-                                    FLB_LOG_EVENT_MSGPACK_RAW_VALUE(mp_sbuf.data, mp_sbuf.size));
-                        }
+                        ret = flb_log_event_encoder_dynamic_field_flush(&encoder->body);
                     }
-
-                    msgpack_sbuffer_clear(&mp_sbuf);
                 }
 
                 if (ret == FLB_EVENT_ENCODER_SUCCESS) {
                     ret = flb_log_event_encoder_commit_record(encoder);
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        (*record_count)++;
+                    }
                 }
                 else {
                     flb_plg_error(ctx->ins, "marshalling error");
@@ -585,12 +764,10 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
     }
 
  binary_payload_to_msgpack_end:
-    msgpack_sbuffer_destroy(&mp_sbuf);
-    msgpack_sbuffer_destroy(&mp_sbuf_meta);
     if (input_logs) {
-        opentelemetry__proto__collector__logs__v1__export_logs_service_request__free_unpacked(
-                                            input_logs, NULL);
+        protobuf_logs_free(input_logs, protobuf_allocator);
     }
+    cfl_arena_destroy(protobuf_arena);
 
     if (ret != 0) {
         return -1;
@@ -615,24 +792,24 @@ int opentelemetry_process_logs(struct flb_opentelemetry *ctx,
     char *buf;
     uint8_t *payload;
     uint64_t payload_size;
+    size_t record_count;
     struct flb_log_event_encoder *encoder;
 
     buf = (char *) data;
     payload = data;
     payload_size = size;
+    record_count = 0;
 
     /* Detect the type of payload */
     if (content_type) {
-        if (strcasecmp(content_type, "application/json") == 0) {
-            if (buf[0] != '{') {
+        if (opentelemetry_is_json_content_type(content_type) == FLB_TRUE) {
+            if (opentelemetry_payload_starts_with_json_object(buf, size) != FLB_TRUE) {
                 flb_plg_error(ctx->ins, "Invalid JSON payload");
                 return -1;
             }
             is_proto = FLB_FALSE;
         }
-        else if (strcasecmp(content_type, "application/protobuf") == 0 ||
-                 strcasecmp(content_type, "application/grpc") == 0 ||
-                 strcasecmp(content_type, "application/x-protobuf") == 0) {
+        else if (opentelemetry_is_protobuf_content_type(content_type) == FLB_TRUE) {
             is_proto = FLB_TRUE;
         }
         else {
@@ -649,7 +826,8 @@ int opentelemetry_process_logs(struct flb_opentelemetry *ctx,
     if (is_proto == FLB_TRUE) {
         ret = binary_payload_to_msgpack(ctx, encoder,
                                         tag, tag_len,
-                                        (uint8_t *) payload, payload_size);
+                                        (uint8_t *) payload, payload_size,
+                                        &record_count);
         if (ret < 0) {
             flb_plg_error(ctx->ins, "failed to process logs from protobuf payload");
         }
@@ -669,11 +847,40 @@ int opentelemetry_process_logs(struct flb_opentelemetry *ctx,
     }
 
     if (ret >= 0) {
-        ret = flb_input_log_append(ctx->ins,
-                                   tag,
-                                   flb_sds_len(tag),
-                                   encoder->output_buffer,
-                                   encoder->output_length);
+        if (opentelemetry_uses_worker_ingress_queue(ctx)) {
+            size_t allocation_size;
+            void *resized_buffer;
+
+            allocation_size = encoder->buffer.alloc;
+
+            if (allocation_size > encoder->output_length) {
+                resized_buffer = flb_realloc(encoder->output_buffer,
+                                             encoder->output_length);
+                if (resized_buffer != NULL) {
+                    encoder->buffer.data = resized_buffer;
+                    encoder->output_buffer = resized_buffer;
+                    encoder->buffer.alloc = encoder->output_length;
+                    allocation_size = encoder->output_length;
+                }
+            }
+
+            ret = opentelemetry_ingest_logs_take(ctx,
+                                                 record_count,
+                                                 tag,
+                                                 flb_sds_len(tag),
+                                                 encoder->output_buffer,
+                                                 encoder->output_length,
+                                                 allocation_size);
+            flb_log_event_encoder_claim_internal_buffer_ownership(encoder);
+        }
+        else {
+            ret = opentelemetry_ingest_logs(ctx,
+                                            tag,
+                                            flb_sds_len(tag),
+                                            encoder->output_buffer,
+                                            encoder->output_length);
+        }
+
         if (ret != 0) {
             flb_plg_error(ctx->ins, "failed to append logs to the input buffer");
         }

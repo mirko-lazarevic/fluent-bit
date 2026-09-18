@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,12 +23,11 @@
 
 FLB_TLS_DEFINE(struct flb_coro, flb_coro_key);
 
-static pthread_mutex_t coro_mutex_init;
+static pthread_mutex_t coro_mutex_init = PTHREAD_MUTEX_INITIALIZER;
 
 void flb_coro_init()
 {
     FLB_TLS_INIT(flb_coro_key);
-    pthread_mutex_init(&coro_mutex_init, NULL);
 }
 
 void flb_coro_thread_init()

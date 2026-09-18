@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,19 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_msgpack_append_message.h>
+#ifdef FLB_HAVE_PARSER
+#include <fluent-bit/flb_time.h>
+#endif
 
 #include "tcp.h"
 #include "tcp_conn.h"
 
-static inline void consume_bytes(char *buf, int bytes, int length)
+static inline void consume_bytes(char *buf, size_t bytes, size_t length)
 {
+    if (bytes == 0 || bytes > length) {
+        return;
+    }
+
     memmove(buf, buf + bytes, length - bytes);
 }
 
@@ -47,6 +54,7 @@ static inline int process_pack(struct tcp_conn *conn,
     char   *source_address;
 
     ctx = conn->ctx;
+    ret = FLB_EVENT_ENCODER_SUCCESS;
 
     flb_log_event_encoder_reset(ctx->log_encoder);
 
@@ -132,9 +140,17 @@ static inline int process_pack(struct tcp_conn *conn,
     msgpack_unpacked_destroy(&result);
 
     if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-        flb_input_log_append(conn->ins, NULL, 0,
-                             ctx->log_encoder->output_buffer,
-                             ctx->log_encoder->output_length);
+        if (ctx->log_encoder->output_length > 0) {
+            ret = tcp_ingest_logs(ctx,
+                                  ctx->log_encoder->output_buffer,
+                                  ctx->log_encoder->output_length);
+            if (ret != 0) {
+                flb_plg_error(ctx->ins,
+                              "could not append TCP logs for %s:%s. ret=%d",
+                              ctx->listen, ctx->tcp_port, ret);
+                return -1;
+            }
+        }
         ret = 0;
     }
     else {
@@ -152,6 +168,7 @@ static ssize_t parse_payload_json(struct tcp_conn *conn)
     int ret;
     int out_size;
     char *pack;
+    ssize_t processed;
 
     ret = flb_pack_json_state(conn->buf_data, conn->buf_len,
                               &pack, &out_size, &conn->pack_state);
@@ -170,10 +187,23 @@ static ssize_t parse_payload_json(struct tcp_conn *conn)
     }
 
     /* Process the packaged JSON and return the last byte used */
-    process_pack(conn, pack, out_size);
-    flb_free(pack);
+    if (out_size < 0) {
+        flb_free(pack);
+        return -1;
+    }
 
-    return conn->pack_state.last_byte;
+    ret = process_pack(conn, pack, (size_t) out_size);
+    flb_free(pack);
+    if (ret < 0) {
+        return -1;
+    }
+
+    processed = conn->pack_state.last_byte;
+    if (processed < 0 || processed > conn->buf_len) {
+        return -1;
+    }
+
+    return processed;
 }
 
 /*
@@ -183,12 +213,22 @@ static ssize_t parse_payload_json(struct tcp_conn *conn)
 static ssize_t parse_payload_none(struct tcp_conn *conn)
 {
     int ret;
-    int len;
-    int sep_len;
+    size_t len;
+    size_t sep_len;
     size_t consumed = 0;
     char *buf;
     char *s;
     char *separator;
+#ifdef FLB_HAVE_PARSER
+    size_t out_size;
+    int parser_ret;
+    void *out_buf;
+    struct flb_time out_time;
+    char *source_address;
+    char *appended_address_buffer;
+    size_t appended_address_size;
+    int append_result;
+#endif
     struct flb_in_tcp_config *ctx;
 
     ctx = conn->ctx;
@@ -202,26 +242,139 @@ static ssize_t parse_payload_none(struct tcp_conn *conn)
     flb_log_event_encoder_reset(ctx->log_encoder);
 
     while ((s = strstr(buf, separator))) {
-        len = (s - buf);
+        len = (size_t) (s - buf);
         if (len == 0) {
             break;
         }
         else if (len > 0) {
-            ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
+#ifdef FLB_HAVE_PARSER
+            if (ctx->parser != NULL) {
+                out_buf = NULL;
+                out_size = 0;
+                source_address = NULL;
+                appended_address_buffer = NULL;
+                appended_address_size = 0;
+                flb_time_zero(&out_time);
 
-            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-                ret = flb_log_event_encoder_set_current_timestamp(ctx->log_encoder);
+                parser_ret = flb_parser_do(ctx->parser, buf, len,
+                                           &out_buf, &out_size, &out_time);
+                if (parser_ret >= 0) {
+                    ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        if (flb_time_to_nanosec(&out_time) == 0L) {
+                            flb_time_get(&out_time);
+                        }
+                        ret = flb_log_event_encoder_set_timestamp(
+                                ctx->log_encoder, &out_time);
+                    }
+
+                    if (ctx->source_address_key != NULL) {
+                        source_address = flb_connection_get_remote_address(
+                                            conn->connection);
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS &&
+                        source_address != NULL) {
+                        append_result = flb_msgpack_append_message_to_record(
+                                &appended_address_buffer,
+                                &appended_address_size,
+                                ctx->source_address_key,
+                                out_buf,
+                                out_size,
+                                source_address,
+                                strlen(source_address),
+                                MSGPACK_OBJECT_STR);
+                        if (append_result != FLB_MAP_EXPAND_SUCCESS) {
+                            if (appended_address_buffer != NULL) {
+                                flb_free(appended_address_buffer);
+                            }
+                            appended_address_buffer = NULL;
+                            appended_address_size = 0;
+                        }
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS &&
+                        appended_address_buffer != NULL) {
+                        ret = flb_log_event_encoder_set_body_from_raw_msgpack(
+                                ctx->log_encoder, appended_address_buffer,
+                                appended_address_size);
+                    }
+                    else if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_set_body_from_raw_msgpack(
+                                ctx->log_encoder, out_buf, out_size);
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_commit_record(
+                                ctx->log_encoder);
+                    }
+                }
+                else {
+                    flb_plg_debug(ctx->ins, "parser '%s' failed on incoming data",
+                                  ctx->parser_name);
+                    ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_set_current_timestamp(
+                                ctx->log_encoder);
+                    }
+
+                    if (ctx->source_address_key != NULL) {
+                        source_address = flb_connection_get_remote_address(
+                                            conn->connection);
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS &&
+                        source_address != NULL) {
+                        ret = flb_log_event_encoder_append_body_values(
+                                ctx->log_encoder,
+                                FLB_LOG_EVENT_CSTRING_VALUE("log"),
+                                FLB_LOG_EVENT_STRING_VALUE(buf, len),
+                                FLB_LOG_EVENT_CSTRING_VALUE(ctx->source_address_key),
+                                FLB_LOG_EVENT_CSTRING_VALUE(source_address));
+                    }
+                    else if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_append_body_values(
+                                ctx->log_encoder,
+                                FLB_LOG_EVENT_CSTRING_VALUE("log"),
+                                FLB_LOG_EVENT_STRING_VALUE(buf, len));
+                    }
+
+                    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                        ret = flb_log_event_encoder_commit_record(
+                                ctx->log_encoder);
+                    }
+                }
+
+                if (parser_ret >= 0 && out_buf != NULL) {
+                    flb_free(out_buf);
+                }
+                if (appended_address_buffer != NULL) {
+                    flb_free(appended_address_buffer);
+                }
             }
+            else
+#endif
+            {
+                ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
 
-            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-                ret = flb_log_event_encoder_append_body_values(
-                        ctx->log_encoder,
-                        FLB_LOG_EVENT_CSTRING_VALUE("log"),
-                        FLB_LOG_EVENT_STRING_VALUE(buf, len));
-            }
+                if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                    ret = flb_log_event_encoder_set_current_timestamp(
+                            ctx->log_encoder);
+                }
 
-            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-                ret = flb_log_event_encoder_commit_record(ctx->log_encoder);
+                if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                    ret = flb_log_event_encoder_append_body_values(
+                            ctx->log_encoder,
+                            FLB_LOG_EVENT_CSTRING_VALUE("log"),
+                            FLB_LOG_EVENT_STRING_VALUE(buf, len));
+                }
+
+                if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                    ret = flb_log_event_encoder_commit_record(
+                            ctx->log_encoder);
+                }
             }
 
             if (ret != FLB_EVENT_ENCODER_SUCCESS) {
@@ -237,9 +390,17 @@ static ssize_t parse_payload_none(struct tcp_conn *conn)
     }
 
     if (ret == FLB_EVENT_ENCODER_SUCCESS) {
-        flb_input_log_append(conn->ins, NULL, 0,
-                             ctx->log_encoder->output_buffer,
-                             ctx->log_encoder->output_length);
+        if (ctx->log_encoder->output_length > 0) {
+            ret = tcp_ingest_logs(ctx,
+                                  ctx->log_encoder->output_buffer,
+                                  ctx->log_encoder->output_length);
+            if (ret != 0) {
+                flb_plg_error(ctx->ins,
+                              "could not append TCP logs for %s:%s. ret=%d",
+                              ctx->listen, ctx->tcp_port, ret);
+                return -1;
+            }
+        }
     }
     else {
         flb_plg_error(ctx->ins, "log event encoding error : %d", ret);
@@ -260,6 +421,7 @@ int tcp_conn_event(void *data)
     struct tcp_conn *conn;
     struct flb_connection *connection;
     struct flb_in_tcp_config *ctx;
+    int ret = 0;
 
     connection = (struct flb_connection *) data;
 
@@ -269,6 +431,8 @@ int tcp_conn_event(void *data)
 
     event = &connection->event;
 
+    conn->busy = FLB_TRUE;
+
     if (event->mask & MK_EVENT_READ) {
         available = (conn->buf_size - conn->buf_len) - 1;
         if (available < 1) {
@@ -276,6 +440,7 @@ int tcp_conn_event(void *data)
                 flb_plg_warn(ctx->ins,
                              "fd=%i incoming data exceeds 'Buffer_Size' (%zu KB)",
                              event->fd, (ctx->buffer_size / 1024));
+                conn->busy = FLB_FALSE;
                 tcp_conn_del(conn);
                 return -1;
             }
@@ -283,6 +448,7 @@ int tcp_conn_event(void *data)
             size = conn->buf_size + ctx->chunk_size;
             tmp = flb_realloc(conn->buf_data, size);
             if (!tmp) {
+                conn->busy = FLB_FALSE;
                 flb_errno();
                 return -1;
             }
@@ -301,6 +467,7 @@ int tcp_conn_event(void *data)
 
         if (bytes <= 0) {
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
+            conn->busy = FLB_FALSE;
             tcp_conn_del(conn);
             return -1;
         }
@@ -325,28 +492,62 @@ int tcp_conn_event(void *data)
             ret_payload = parse_payload_json(conn);
             if (ret_payload == 0) {
                 /* Incomplete JSON message, we need more data */
-                return -1;
+                ret = -1;
+                goto cleanup;
             }
             else if (ret_payload == -1) {
                 flb_pack_state_reset(&conn->pack_state);
-                flb_pack_state_init(&conn->pack_state);
+                if (flb_pack_state_init(&conn->pack_state) == -1) {
+                    flb_plg_error(ctx->ins,
+                                  "fd=%i failed to reinitialize JSON parser state",
+                                  event->fd);
+                    conn->pending_close = FLB_TRUE;
+                    ret = -1;
+                    goto cleanup;
+                }
                 conn->pack_state.multiple = FLB_TRUE;
-                return -1;
+                ret = -1;
+                goto cleanup;
             }
         }
         else if (ctx->format == FLB_TCP_FMT_NONE) {
             ret_payload = parse_payload_none(conn);
             if (ret_payload == 0) {
-                return -1;
+                ret = -1;
+                goto cleanup;
             }
             else if (ret_payload == -1) {
                 conn->buf_len = 0;
-                return -1;
+                ret = -1;
+                goto cleanup;
             }
         }
 
 
-        consume_bytes(conn->buf_data, ret_payload, conn->buf_len);
+        if (ret_payload < 0 || ret_payload > conn->buf_len) {
+            flb_plg_warn(ctx->ins,
+                         "fd=%i invalid payload consume length=%zd buf_len=%i",
+                         event->fd, ret_payload, conn->buf_len);
+
+            if (ctx->format == FLB_TCP_FMT_JSON) {
+                flb_pack_state_reset(&conn->pack_state);
+                if (flb_pack_state_init(&conn->pack_state) == -1) {
+                    flb_plg_error(ctx->ins,
+                                  "fd=%i failed to reinitialize JSON parser state",
+                                  event->fd);
+                    conn->pending_close = FLB_TRUE;
+                    ret = -1;
+                    goto cleanup;
+                }
+                conn->pack_state.multiple = FLB_TRUE;
+            }
+
+            conn->buf_len = 0;
+            ret = -1;
+            goto cleanup;
+        }
+
+        consume_bytes(conn->buf_data, (size_t) ret_payload, (size_t) conn->buf_len);
         conn->buf_len -= ret_payload;
         conn->buf_data[conn->buf_len] = '\0';
 
@@ -357,16 +558,27 @@ int tcp_conn_event(void *data)
             conn->pack_state.buf_len = 0;
         }
 
-        return bytes;
+        ret = bytes;
+        goto cleanup;
     }
 
     if (event->mask & MK_EVENT_CLOSE) {
         flb_plg_trace(ctx->ins, "fd=%i hangup", event->fd);
+        conn->busy = FLB_FALSE;
         tcp_conn_del(conn);
         return -1;
     }
 
-    return 0;
+    ret = 0;
+
+cleanup:
+    conn->busy = FLB_FALSE;
+    if (conn->pending_close) {
+        tcp_conn_del(conn);
+        return -1;
+    }
+
+    return ret;
 }
 
 /* Create a new mqtt request instance */
@@ -431,6 +643,9 @@ struct tcp_conn *tcp_conn_add(struct flb_connection *connection,
     }
 
     mk_list_add(&conn->_head, &ctx->connections);
+
+    conn->busy = FLB_FALSE;
+    conn->pending_close = FLB_FALSE;
 
     return conn;
 }

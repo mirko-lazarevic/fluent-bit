@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,11 +35,13 @@
 
 struct flb_plugin_proxy_def {
     /* Fields populated once remote flb_cb_register() is called */
-    int type;                 /* defined by FLB_PROXY_[INPUT|OUTPUT]_PLUGIN  */
-    int proxy;                /* proxy type                                  */
+    int type;                           /* defined by FLB_PROXY_[INPUT|OUTPUT]_PLUGIN  */
+    int proxy;                          /* proxy type                                  */
     int flags;
-    char *name;               /* plugin short name                           */
-    char *description;        /* plugin description                          */
+    char *name;                         /* plugin short name                           */
+    char *description;                  /* plugin description                          */
+    int event_type;                     /* event type (logs/metrics/traces)            */
+    struct flb_config_map *config_map;  /* plugin's configuration                      */
 };
 
 /* Proxy context */
@@ -65,6 +67,8 @@ struct flb_plugin_proxy_context {
 
 struct flb_plugin_input_proxy_context {
     int coll_fd;
+    /* This context is set by the remote init and is passed to remote collect */
+    void *remote_context;
     /* A proxy ptr is needed to store the proxy type/lang (OUTPUT/GOLANG) */
     struct flb_plugin_proxy *proxy;
 };

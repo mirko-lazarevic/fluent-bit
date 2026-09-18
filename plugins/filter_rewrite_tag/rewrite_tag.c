@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -414,7 +414,8 @@ static int process_record(const char *tag, int tag_len, msgpack_object map,
     /* Release the tag */
     flb_sds_destroy(out_tag);
 
-    if (ret == -1) {
+    if (ret < 0) {
+        *keep = FLB_TRUE;
         return FLB_FALSE;
     }
 

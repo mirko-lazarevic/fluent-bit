@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -518,6 +518,10 @@ int flb_log_event_encoder_append_forward_v1_timestamp(
     struct flb_time *timestamp)
 {
     uint32_t value[2];
+
+    if (flb_time_is_valid_eventtime(timestamp) != FLB_TRUE) {
+        return FLB_EVENT_ENCODER_ERROR_INVALID_ARGUMENT;
+    }
 
     value[0] = FLB_UINT32_TO_NETWORK_BYTE_ORDER((uint32_t) timestamp->tm.tv_sec);
     value[1] = FLB_UINT32_TO_NETWORK_BYTE_ORDER((uint32_t) timestamp->tm.tv_nsec);

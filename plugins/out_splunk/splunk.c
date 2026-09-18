@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -405,6 +405,44 @@ static int pack_map_meta(struct flb_splunk *ctx,
     return 0;
 }
 
+/*
+ * Resolve the value for the top level HEC 'time' field. By default the Fluent
+ * Bit event timestamp is used, but when 'time_key' is set and the record holds
+ * a valid timestamp on that key, the record value takes precedence.
+ */
+static double get_event_time(struct flb_splunk *ctx, struct flb_time *tm,
+                             msgpack_object map)
+{
+    int ret;
+    struct flb_time record_tm;
+    struct flb_ra_value *rval;
+
+    if (ctx->ra_time_key == NULL) {
+        return flb_time_to_double(tm);
+    }
+
+    rval = flb_ra_get_value_object(ctx->ra_time_key, map);
+    if (rval == NULL) {
+        flb_plg_debug(ctx->ins,
+                      "time_key '%s' not found in record, using the event "
+                      "timestamp", ctx->time_key);
+        return flb_time_to_double(tm);
+    }
+
+    ret = flb_time_from_msgpack_object(&record_tm, &rval->o,
+                                       &ctx->time_key_fmt);
+    flb_ra_key_value_destroy(rval);
+
+    if (ret != 0) {
+        flb_plg_warn(ctx->ins,
+                     "could not parse a timestamp from time_key '%s', using "
+                     "the event timestamp", ctx->time_key);
+        return flb_time_to_double(tm);
+    }
+
+    return flb_time_to_double(&record_tm);
+}
+
 static int pack_map(struct flb_splunk *ctx, msgpack_packer *mp_pck,
                     struct flb_time *tm,
                     msgpack_object *group_metadata,
@@ -422,22 +460,25 @@ static int pack_map(struct flb_splunk *ctx, msgpack_packer *mp_pck,
     msgpack_object v;
     struct flb_mp_map_header mh;
 
-    t = flb_time_to_double(tm);
     map_size = map.via.map.size;
 
     if (ctx->splunk_send_raw == FLB_TRUE) {
         msgpack_pack_map(mp_pck, map_size /* all k/v */);
     }
     else {
+        t = get_event_time(ctx, tm, map);
+
         flb_mp_map_header_init(&mh, mp_pck);
 
-        /* Append the time key */
-        flb_mp_map_header_append(&mh);
-        msgpack_pack_str(mp_pck, sizeof(FLB_SPLUNK_DEFAULT_TIME) -1);
-        msgpack_pack_str_body(mp_pck,
-                              FLB_SPLUNK_DEFAULT_TIME,
-                              sizeof(FLB_SPLUNK_DEFAULT_TIME) - 1);
-        msgpack_pack_double(mp_pck, t);
+        if (ctx->auto_extract_timestamp == FLB_FALSE) {
+            /* Append the time key */
+            flb_mp_map_header_append(&mh);
+            msgpack_pack_str(mp_pck, sizeof(FLB_SPLUNK_DEFAULT_TIME) -1);
+            msgpack_pack_str_body(mp_pck,
+                                  FLB_SPLUNK_DEFAULT_TIME,
+                                  sizeof(FLB_SPLUNK_DEFAULT_TIME) - 1);
+            msgpack_pack_double(mp_pck, t);
+        }
 
         /* Pack Splunk metadata */
         pack_map_meta(ctx, &mh, mp_pck, map, tag, tag_len);
@@ -489,7 +530,6 @@ static inline int pack_event_key(struct flb_splunk *ctx, msgpack_packer *mp_pck,
     struct flb_mp_map_header mh;
     flb_sds_t val;
 
-    t = flb_time_to_double(tm);
     val = flb_ra_translate(ctx->ra_event_key, tag, tag_len, map, NULL);
     if (!val || flb_sds_len(val) == 0) {
         if (val != NULL) {
@@ -500,15 +540,19 @@ static inline int pack_event_key(struct flb_splunk *ctx, msgpack_packer *mp_pck,
     }
 
     if (ctx->splunk_send_raw == FLB_FALSE) {
+        t = get_event_time(ctx, tm, map);
+
         flb_mp_map_header_init(&mh, mp_pck);
 
-        /* Append the time key */
-        flb_mp_map_header_append(&mh);
-        msgpack_pack_str(mp_pck, sizeof(FLB_SPLUNK_DEFAULT_TIME) -1);
-        msgpack_pack_str_body(mp_pck,
-                              FLB_SPLUNK_DEFAULT_TIME,
-                              sizeof(FLB_SPLUNK_DEFAULT_TIME) - 1);
-        msgpack_pack_double(mp_pck, t);
+        if (ctx->auto_extract_timestamp == FLB_FALSE) {
+            /* Append the time key */
+            flb_mp_map_header_append(&mh);
+            msgpack_pack_str(mp_pck, sizeof(FLB_SPLUNK_DEFAULT_TIME) -1);
+            msgpack_pack_str_body(mp_pck,
+                                  FLB_SPLUNK_DEFAULT_TIME,
+                                  sizeof(FLB_SPLUNK_DEFAULT_TIME) - 1);
+            msgpack_pack_double(mp_pck, t);
+        }
 
         /* Pack Splunk metadata */
         pack_map_meta(ctx, &mh, mp_pck, map, tag, tag_len);
@@ -637,7 +681,7 @@ static flb_sds_t get_metadata_auth_header(struct flb_splunk *ctx)
 static inline int splunk_format(const void *in_buf, size_t in_bytes,
                                 char *tag, int tag_len,
                                 char **out_buf, size_t *out_size,
-                                struct flb_splunk *ctx)
+                                struct flb_splunk *ctx, struct flb_config *config)
 {
     int ret;
     char *err;
@@ -726,7 +770,7 @@ static inline int splunk_format(const void *in_buf, size_t in_bytes,
         /* Validate packaging */
         if (ret != 0) {
             /* Format invalid record */
-            err = flb_msgpack_to_json_str(2048, &map);
+            err = flb_msgpack_to_json_str(2048, &map, config->json_escape_unicode);
             if (err) {
                 /* Print error and continue processing other records */
                 flb_plg_warn(ctx->ins, "could not process or pack record: %s", err);
@@ -737,7 +781,8 @@ static inline int splunk_format(const void *in_buf, size_t in_bytes,
         }
 
         /* Format as JSON */
-        record = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size);
+        record = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size,
+                                             config->json_escape_unicode);
         if (!record) {
             flb_errno();
             msgpack_sbuffer_destroy(&mp_sbuf);
@@ -868,6 +913,7 @@ static void cb_splunk_flush(struct flb_event_chunk *event_chunk,
     flb_sds_t buf_data;
     size_t resp_size;
     size_t buf_size;
+    const char *endpoint;
     struct flb_splunk *ctx = out_context;
     struct flb_connection *u_conn;
     struct flb_http_client *c;
@@ -898,7 +944,8 @@ static void cb_splunk_flush(struct flb_event_chunk *event_chunk,
                             event_chunk->size,
                             (char *) event_chunk->tag,
                             flb_sds_len(event_chunk->tag),
-                            &buf_data, &buf_size, ctx);
+                            &buf_data, &buf_size, ctx,
+                            config);
     }
 
     if (ret == -1) {
@@ -926,8 +973,13 @@ static void cb_splunk_flush(struct flb_event_chunk *event_chunk,
         }
     }
 
+    endpoint = FLB_SPLUNK_DEFAULT_ENDPOINT;
+    if (ctx->auto_extract_timestamp == FLB_TRUE) {
+        endpoint = FLB_SPLUNK_AUTO_EXTRACT_ENDPOINT;
+    }
+
     /* Compose HTTP Client request */
-    c = flb_http_client(u_conn, FLB_HTTP_POST, FLB_SPLUNK_DEFAULT_ENDPOINT,
+    c = flb_http_client(u_conn, FLB_HTTP_POST, endpoint,
                         payload_buf, payload_size, NULL, 0, NULL, 0);
 
     /* HTTP Response buffer size, honor value set by the user */
@@ -1070,7 +1122,7 @@ static struct flb_config_map config_map[] = {
     },
 
     {
-     FLB_CONFIG_MAP_STR, "http_passwd", "",
+     FLB_CONFIG_MAP_STR, "http_passwd", NULL,
      0, FLB_TRUE, offsetof(struct flb_splunk, http_passwd),
      "Set HTTP auth password"
     },
@@ -1139,6 +1191,25 @@ static struct flb_config_map config_map[] = {
     },
 
     {
+     FLB_CONFIG_MAP_STR, "time_key", NULL,
+     0, FLB_TRUE, offsetof(struct flb_splunk, time_key),
+     "Set a record key that will populate the top level 'time' field of the "
+     "HTTP Event Collector payload. A record accessor pattern is allowed, e.g: "
+     "'$aggregator_time'. If the key is not found or its value cannot be "
+     "interpreted as a timestamp, the Fluent Bit event timestamp is used "
+     "instead. This option is ignored when 'splunk_send_raw' is enabled."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "time_key_format", NULL,
+     0, FLB_TRUE, offsetof(struct flb_splunk, time_key_format),
+     "Set the strptime(3) compatible format used to parse the value of "
+     "'time_key' when it holds a string, e.g: '%Y-%m-%dT%H:%M:%S.%LZ'. The "
+     "'%L' specifier can be used for fractional seconds. If unset, string "
+     "values are expected to contain a numeric Unix timestamp."
+    },
+
+    {
      FLB_CONFIG_MAP_SLIST_2, "event_field", NULL,
      FLB_CONFIG_MAP_MULT, FLB_TRUE, offsetof(struct flb_splunk, event_fields),
      "Set event fields for the record. This option can be set multiple times and "
@@ -1158,6 +1229,14 @@ static struct flb_config_map config_map[] = {
      "When enabled, the record keys and values are set in the top level of the "
      "map instead of under the event key. Refer to the Sending Raw Events section "
      "from the docs for more details to make this option work properly."
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "auto_extract_timestamp", "off",
+     0, FLB_TRUE, offsetof(struct flb_splunk, auto_extract_timestamp),
+     "Ask Splunk to extract the timestamp from the event data by setting "
+     "auto_extract_timestamp=true in the HTTP Event Collector URL and omitting "
+     "the time field from the event envelope."
     },
 
     {
@@ -1183,7 +1262,7 @@ static int cb_splunk_format_test(struct flb_config *config,
     struct flb_splunk *ctx = plugin_context;
 
     return splunk_format(data, bytes, (char *) tag, tag_len,
-                         (char**) out_data, out_size,ctx);
+                         (char**) out_data, out_size, ctx, config);
 }
 
 struct flb_output_plugin out_splunk_plugin = {

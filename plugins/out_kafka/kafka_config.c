@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -49,6 +49,10 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
     }
     ctx->ins = ins;
     ctx->blocked = FLB_FALSE;
+    mk_list_init(&ctx->topics);
+#ifdef FLB_HAVE_KAFKA_SCHEMA_REGISTRY
+    mk_list_init(&ctx->schema_registry_endpoints);
+#endif
 
     ret = flb_output_config_map_set(ins, (void*) ctx);
     if (ret == -1) {
@@ -127,12 +131,33 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
             ctx->format = FLB_KAFKA_FMT_AVRO;
         }
 #endif
+        else if (strcasecmp(ctx->format_str, "protobuf") == 0) {
+#ifdef FLB_HAVE_PROTOBUF_ENCODER
+            ctx->format = FLB_KAFKA_FMT_PROTOBUF;
+#else
+            flb_plg_error(ins, "format protobuf requires FLB_PROTOBUF_ENCODER=On");
+            flb_out_kafka_destroy(ctx);
+            return NULL;
+#endif
+        }
         else if (strcasecmp(ctx->format_str, "raw") == 0) {
             ctx->format = FLB_KAFKA_FMT_RAW;
+        }
+        else if (strcasecmp(ctx->format_str, "otlp_json") == 0) {
+            ctx->format = FLB_KAFKA_FMT_OTLP_JSON;
+        }
+        else if (strcasecmp(ctx->format_str, "otlp_proto") == 0) {
+            ctx->format = FLB_KAFKA_FMT_OTLP_PROTO;
         }
     }
     else {
         ctx->format = FLB_KAFKA_FMT_JSON;
+    }
+
+    ins->event_type = FLB_OUTPUT_LOGS;
+    if (ctx->format == FLB_KAFKA_FMT_OTLP_JSON ||
+        ctx->format == FLB_KAFKA_FMT_OTLP_PROTO) {
+        ins->event_type |= FLB_OUTPUT_METRICS | FLB_OUTPUT_TRACES;
     }
 
     /* Config: Message_Key */
@@ -239,24 +264,29 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
     if (!ctx->kafka.rk) {
         flb_plg_error(ctx->ins, "failed to create producer: %s",
                       errstr);
+        rd_kafka_conf_destroy(ctx->conf);
+        ctx->conf = NULL;
         flb_out_kafka_destroy(ctx);
         return NULL;
     }
+    /* rd_kafka_new() succeeded, conf ownership transferred to rk */
+    ctx->conf = NULL;
 
-#ifdef FLB_HAVE_AVRO_ENCODER
-    /* Config AVRO */
+#ifdef FLB_HAVE_KAFKA_SCHEMA_REGISTRY
+    /* Inline Avro schema or Schema Registry configuration */
     tmp = flb_output_get_property("schema_str", ins);
     if (tmp) {
-        ctx->avro_fields.schema_str = flb_sds_create(tmp);
+        ctx->schema_str = flb_sds_create(tmp);
     }
-    tmp = flb_output_get_property("schema_id", ins);
-    if (tmp) {
-        ctx->avro_fields.schema_id = flb_sds_create(tmp);
+
+    ret = flb_kafka_schema_registry_configure(ctx, config);
+    if (ret == -1) {
+        flb_out_kafka_destroy(ctx);
+        return NULL;
     }
 #endif
 
     /* Config: Topic */
-    mk_list_init(&ctx->topics);
     tmp = flb_output_get_property("topics", ins);
     if (!tmp) {
         flb_kafka_topic_create(FLB_KAFKA_TOPIC, ctx);
@@ -281,8 +311,9 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
     }
 
     flb_plg_info(ctx->ins, "brokers='%s' topics='%s'", ctx->kafka.brokers, tmp);
-#ifdef FLB_HAVE_AVRO_ENCODER
-    flb_plg_info(ctx->ins, "schemaID='%s' schema='%s'", ctx->avro_fields.schema_id, ctx->avro_fields.schema_str);
+#ifdef FLB_HAVE_KAFKA_SCHEMA_REGISTRY
+    flb_plg_info(ctx->ins, "schemaID='%d' schema='%s'",
+                 ctx->schema_id, ctx->schema_str != NULL ? ctx->schema_str : "");
 #endif
 
     return ctx;
@@ -304,6 +335,10 @@ int flb_out_kafka_destroy(struct flb_out_kafka *ctx)
         rd_kafka_destroy(ctx->kafka.rk);
     }
 
+    if (ctx->conf) {
+        rd_kafka_conf_destroy(ctx->conf);
+    }
+
     if (ctx->opaque) {
         flb_kafka_opaque_destroy(ctx->opaque);
     }
@@ -322,10 +357,9 @@ int flb_out_kafka_destroy(struct flb_out_kafka *ctx)
 
     flb_sds_destroy(ctx->sasl_mechanism);
 
-#ifdef FLB_HAVE_AVRO_ENCODER
-    // avro
-    flb_sds_destroy(ctx->avro_fields.schema_id);
-    flb_sds_destroy(ctx->avro_fields.schema_str);
+#ifdef FLB_HAVE_KAFKA_SCHEMA_REGISTRY
+    flb_sds_destroy(ctx->schema_str);
+    flb_kafka_schema_registry_destroy(ctx);
 #endif
 
     flb_free(ctx);

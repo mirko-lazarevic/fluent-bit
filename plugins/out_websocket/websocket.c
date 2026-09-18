@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -85,9 +85,10 @@ static int flb_ws_handshake(struct flb_connection *u_conn,
             flb_debug("[output_ws] Websocket Server Response\n%s",
                 c->resp.payload);
         }
+        flb_debug("[out_ws] Http Get Operation ret = %i, http resp = %i",
+                  ret, c->resp.status);
         flb_http_client_destroy(c);
         flb_upstream_conn_release(u_conn);
-        flb_debug("[out_ws] Http Get Operation ret = %i, http resp = %i", ret, c->resp.status);
         return -1;
     }
     flb_http_client_destroy(c);
@@ -254,7 +255,8 @@ static void cb_ws_flush(struct flb_event_chunk *event_chunk,
                                                event_chunk->size,
                                                ctx->out_format,
                                                ctx->json_date_format,
-                                               ctx->json_date_key);
+                                               ctx->json_date_key,
+                                               config->json_escape_unicode);
 
         if (!json) {
             flb_error("[out_ws] error formatting JSON payload");

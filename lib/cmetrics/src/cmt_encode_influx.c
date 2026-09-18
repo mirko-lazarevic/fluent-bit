@@ -25,6 +25,8 @@
 #include <cmetrics/cmt_untyped.h>
 #include <cmetrics/cmt_summary.h>
 #include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_exp_histogram.h>
+#include <cmetrics/cmt_atomic.h>
 #include <cmetrics/cmt_compat.h>
 
 #include <ctype.h>
@@ -159,9 +161,49 @@ static void append_metric_value(struct cmt_map *map,
     double val;
     char tmp[256];
     struct cmt_opts *opts;
+    struct cmt_map fake_map;
+    struct cmt_metric fake_metric;
+    struct cmt_histogram fake_histogram;
+    struct cmt_histogram_buckets fake_buckets;
+    size_t bucket_count;
+    size_t upper_bounds_count;
+    uint64_t *bucket_values;
+    double *upper_bounds;
 
     if (map->type == CMT_HISTOGRAM) {
         return append_histogram_metric_value(map, buf, metric);
+    }
+    else if (map->type == CMT_EXP_HISTOGRAM) {
+        if (cmt_exp_histogram_to_explicit(metric,
+                                          &upper_bounds,
+                                          &upper_bounds_count,
+                                          &bucket_values,
+                                          &bucket_count) == 0) {
+            memset(&fake_map, 0, sizeof(struct cmt_map));
+            memset(&fake_metric, 0, sizeof(struct cmt_metric));
+            memset(&fake_histogram, 0, sizeof(struct cmt_histogram));
+            memset(&fake_buckets, 0, sizeof(struct cmt_histogram_buckets));
+
+            fake_buckets.count = upper_bounds_count;
+            fake_buckets.upper_bounds = upper_bounds;
+            fake_histogram.buckets = &fake_buckets;
+
+            fake_map = *map;
+            fake_map.type = CMT_HISTOGRAM;
+            fake_map.parent = &fake_histogram;
+
+            fake_metric = *metric;
+            fake_metric.hist_buckets = bucket_values;
+            fake_metric.hist_count = bucket_values[bucket_count - 1];
+            fake_metric.hist_sum = cmt_atomic_load(&metric->exp_hist_sum);
+
+            append_histogram_metric_value(&fake_map, buf, &fake_metric);
+
+            free(bucket_values);
+            free(upper_bounds);
+        }
+
+        return;
     }
     else if (map->type == CMT_SUMMARY) {
         return append_summary_metric_value(map, buf, metric);
@@ -224,18 +266,26 @@ static int append_string(cfl_sds_t *buf, cfl_sds_t str)
 static void format_metric(struct cmt *cmt, cfl_sds_t *buf, struct cmt_map *map,
                           struct cmt_metric *metric)
 {
-    int i;
     int n;
+    int emitted_count = 0;
     int static_count = 0;
     int static_labels = 0;
     int has_namespace = CMT_FALSE;
+    int label_key_count;
+    int label_index;
     struct cmt_map_label *label_k;
     struct cmt_map_label *label_v;
     struct cfl_list *head;
     struct cmt_opts *opts;
     struct cmt_label *slabel;
 
-    if (map->type == CMT_SUMMARY && !metric->sum_quantiles_set) {
+    if (map->type == CMT_SUMMARY && !cmt_atomic_load(&metric->sum_quantiles_set)) {
+        return;
+    }
+
+    n = cfl_list_size(&metric->labels);
+    label_key_count = map->label_count;
+    if (n > label_key_count) {
         return;
     }
 
@@ -280,34 +330,38 @@ static void format_metric(struct cmt *cmt, cfl_sds_t *buf, struct cmt_map *map,
     }
 
     /* Labels / Tags */
-    n = cfl_list_size(&metric->labels);
-    if (n > 0) {
-        if (static_labels > 0 || has_namespace == CMT_TRUE) {
-            cfl_sds_cat_safe(buf, ",", 1);
-        }
-
+    if (n > 0 && label_key_count > 0) {
         label_k = cfl_list_entry_first(&map->label_keys, struct cmt_map_label, _head);
 
-        i = 1;
+        label_index = 0;
         cfl_list_foreach(head, &metric->labels) {
             label_v = cfl_list_entry(head, struct cmt_map_label, _head);
+
+            if (label_k->name == NULL || label_v->name == NULL) {
+                label_index++;
+                label_k = cfl_list_entry_next(&label_k->_head, struct cmt_map_label,
+                                              _head, &map->label_keys);
+                continue;
+            }
+
+            if (static_labels > 0 || has_namespace == CMT_TRUE ||
+                emitted_count > 0) {
+                cfl_sds_cat_safe(buf, ",", 1);
+            }
 
             /* key */
             append_string(buf, label_k->name);
             cfl_sds_cat_safe(buf, "=", 1);
             append_string(buf, label_v->name);
+            emitted_count++;
 
-            if (i < n) {
-                cfl_sds_cat_safe(buf, ",", 1);
-            }
-            i++;
-
+            label_index++;
             label_k = cfl_list_entry_next(&label_k->_head, struct cmt_map_label,
-                                         _head, &map->label_keys);
+                                          _head, &map->label_keys);
         }
     }
 
-    if (has_namespace == CMT_TRUE || static_labels > 0 || n > 0) {
+    if (has_namespace == CMT_TRUE || static_labels > 0 || emitted_count > 0) {
         cfl_sds_cat_safe(buf, " ", 1);
     }
     append_metric_value(map, buf, metric);
@@ -340,6 +394,7 @@ cfl_sds_t cmt_encode_influx_create(struct cmt *cmt)
     struct cmt_untyped *untyped;
     struct cmt_summary *summary;
     struct cmt_histogram *histogram;
+    struct cmt_exp_histogram *exp_histogram;
 
     /* Allocate a 1KB of buffer */
     buf = cfl_sds_create_size(1024);
@@ -369,6 +424,12 @@ cfl_sds_t cmt_encode_influx_create(struct cmt *cmt)
     cfl_list_foreach(head, &cmt->histograms) {
         histogram = cfl_list_entry(head, struct cmt_histogram, _head);
         format_metrics(cmt, &buf, histogram->map);
+    }
+
+    /* Exponential Histograms */
+    cfl_list_foreach(head, &cmt->exp_histograms) {
+        exp_histogram = cfl_list_entry(head, struct cmt_exp_histogram, _head);
+        format_metrics(cmt, &buf, exp_histogram->map);
     }
 
     /* Untyped */

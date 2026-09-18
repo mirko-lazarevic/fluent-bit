@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -41,6 +41,14 @@
 #define FLB_TAIL_METRIC_F_OPENED  100  /* number of opened files  */
 #define FLB_TAIL_METRIC_F_CLOSED  101  /* number of closed files  */
 #define FLB_TAIL_METRIC_F_ROTATED 102  /* number of rotated files */
+#define FLB_TAIL_METRIC_M_TRUNCATED 103  /* number of truncated occurrences of multiline */
+#define FLB_TAIL_METRIC_L_TRUNCATED 104  /* number of truncated occurrences of long lines */
+#define FLB_TAIL_METRIC_L_SKIPPED 105  /* number of skipped occurrences of long lines */
+#endif
+
+#ifdef FLB_SYSTEM_WINDOWS
+#define FLB_TAIL_WINDOWS_PATH_ENCODING_ANSI 0
+#define FLB_TAIL_WINDOWS_PATH_ENCODING_UTF8 1
 #endif
 
 struct flb_tail_config {
@@ -53,6 +61,7 @@ struct flb_tail_config {
     /* Buffer Config */
     size_t buf_chunk_size;     /* allocation chunks        */
     size_t buf_max_size;       /* max size of a buffer     */
+    int    truncate_long_lines; /* truncate long lines after re-encode */
 
     /* Static files processor */
     size_t static_batch_size;
@@ -69,11 +78,11 @@ struct flb_tail_config {
     int coll_fd_inactive;
     int coll_fd_dmode_flush;
     int coll_fd_mult_flush;
-    int coll_fd_progress_check;
 
     /* Backend collectors */
     int coll_fd_fs1;           /* used by fs_inotify & fs_stat */
     int coll_fd_fs2;           /* only used by fs_stat         */
+    int coll_fd_progress_check; /* inotify missed-event recovery timer */
 
     /* Configuration */
     int dynamic_tag;           /* dynamic tag ? e.g: abc.*     */
@@ -92,6 +101,9 @@ struct flb_tail_config {
                                     * being ingested */
     time_t last_pending;       /* last time a 'pending signal' was emitted' */
     struct mk_list *path_list; /* list of paths to scan (glob) */
+#ifdef FLB_SYSTEM_WINDOWS
+    int windows_path_encoding; /* Windows path API encoding mode */
+#endif
     flb_sds_t path_key;        /* key name of file path        */
     flb_sds_t key;             /* key for unstructured record  */
     int   skip_long_lines;     /* skip long lines              */
@@ -163,16 +175,22 @@ struct flb_tail_config {
     struct flb_log_event_encoder log_event_encoder;
     struct flb_log_event_decoder log_event_decoder;
 
+#ifdef FLB_HAVE_METRICS
     /* Metrics */
     struct cmt_counter *cmt_files_opened;
     struct cmt_counter *cmt_files_closed;
     struct cmt_counter *cmt_files_rotated;
+    struct cmt_counter *cmt_multiline_truncated;
+    struct cmt_counter *cmt_long_line_truncated;
+    struct cmt_counter *cmt_long_line_skipped;
+#endif
 
     /* Hash: hash tables for quick acess to registered files */
     struct flb_hash_table *static_hash;
     struct flb_hash_table *event_hash;
 
     struct flb_hash_table *ignored_file_sizes;
+    struct flb_hash_table *aged_out_file_inodes;
 
     struct flb_config *config;
 };

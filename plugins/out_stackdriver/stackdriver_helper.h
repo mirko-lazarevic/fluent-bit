@@ -1,6 +1,6 @@
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -47,5 +47,7 @@ void try_assign_subfield_bool(msgpack_object obj, int *subfield);
  * Otherwise leave the subfield untouched
  */
 void try_assign_subfield_int(msgpack_object obj, int64_t *subfield);
+
+void pack_sds_safe(msgpack_packer *mp_pck, flb_sds_t s);
 
 #endif

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,7 +35,11 @@
 #include <stdarg.h>
 
 /* FIXME: this extern should be auto-populated from flb_thread_storage.h */
-extern FLB_TLS_DEFINE(struct flb_log, flb_log_ctx)
+#ifndef FLB_HAVE_C_TLS
+FLB_TLS_DECLARE(struct flb_log, flb_log_ctx);
+#else
+extern FLB_TLS_DEFINE(struct flb_log, flb_log_ctx);
+#endif
 
 /* Message types */
 #define FLB_LOG_OFF     0
@@ -59,10 +63,30 @@ extern FLB_TLS_DEFINE(struct flb_log, flb_log_ctx)
 
 #define FLB_LOG_MNG_TERMINATION_SIGNAL 1
 #define FLB_LOG_MNG_REFRESH_SIGNAL     2
+#define FLB_LOG_MNG_DRAIN_SIGNAL       3
 
 
 #define FLB_LOG_CACHE_ENTRIES        10
 #define FLB_LOG_CACHE_TEXT_BUF_SIZE  1024
+#define FLB_LOG_QUEUE_LIMIT          1024
+
+struct flb_log_record {
+    int type;
+    uint64_t timestamp_sec;
+    uint32_t timestamp_nsec;
+    size_t size;
+    struct flb_log_record *next;
+    char msg[];
+};
+
+struct flb_log_queue {
+    size_t length;
+    size_t limit;
+    int signal_pending;
+    struct flb_log_record *head;
+    struct flb_log_record *tail;
+    pthread_mutex_t mutex;
+};
 
 /* Logging main context */
 struct flb_log {
@@ -70,6 +94,7 @@ struct flb_log {
     flb_pipefd_t ch_mng[2];    /* worker channel manager   */
     uint16_t type;             /* log type                 */
     uint16_t level;            /* level                    */
+    int out_fd;                /* output file descriptor   */
     char *out;                 /* FLB_LOG_FILE or FLB_LOG_SOCKET */
     pthread_t tid;             /* thread ID   */
     struct flb_worker *worker; /* non-real worker reference */
@@ -80,11 +105,26 @@ struct flb_log {
     int pth_init;
     pthread_cond_t  pth_cond;
     pthread_mutex_t pth_mutex;
+
+    /* Log transport queue */
+    size_t queue_length;
+    size_t queue_limit;
+    size_t dropped_records;
+    int queue_signal_pending;
+    struct flb_log_record *queue_head;
+    struct flb_log_record *queue_tail;
+    pthread_mutex_t queue_mutex;
+
+    /* Pipeline mirror queue */
+    int pipeline_enabled;
+    flb_pipefd_t pipeline_ch[2];
+    struct flb_log_queue pipeline_queue;
 };
 
 struct flb_log_cache_entry {
     flb_sds_t buf;
     uint64_t timestamp;
+    int interval;
     struct mk_list _head;
 };
 
@@ -101,6 +141,9 @@ struct flb_log_metrics {
 
     /* cmetrics */
     struct cmt_counter *logs_total_counter; /* total number of logs (by message type) */
+    struct cmt_counter *queue_enqueue_counter;
+    struct cmt_counter *queue_drop_counter;
+    struct cmt_counter *queue_drain_counter;
 };
 
 /*
@@ -139,6 +182,11 @@ int flb_log_set_file(struct flb_config *config, char *out);
 int flb_log_destroy(struct flb_log *log, struct flb_config *config);
 void flb_log_print(int type, const char *file, int line, const char *fmt, ...) FLB_FORMAT_PRINTF(4, 5);
 int flb_log_is_truncated(int type, const char *file, int line, const char *fmt, ...) FLB_FORMAT_PRINTF(4, 5);
+void flb_log_record_destroy(struct flb_log_record *record);
+int flb_log_pipeline_enable(struct flb_config *config);
+void flb_log_pipeline_disable(struct flb_config *config);
+flb_pipefd_t flb_log_pipeline_get_event_fd(struct flb_config *config);
+struct flb_log_record *flb_log_pipeline_dequeue(struct flb_config *config);
 
 struct flb_log_cache *flb_log_cache_create(int timeout_seconds, int size);
 void flb_log_cache_destroy(struct flb_log_cache *cache);
@@ -146,11 +194,15 @@ struct flb_log_cache_entry *flb_log_cache_exists(struct flb_log_cache *cache, ch
 struct flb_log_cache_entry *flb_log_cache_get_target(struct flb_log_cache *cache, uint64_t ts);
 
 int flb_log_cache_check_suppress(struct flb_log_cache *cache, char *msg_buf, size_t msg_size);
+int flb_log_cache_check_suppress_interval(struct flb_log_cache *cache,
+                                          char *msg_buf, size_t msg_size,
+                                          int interval_seconds);
 
 
 static inline int flb_log_suppress_check(int log_suppress_interval, const char *fmt, ...)
 {
     int ret;
+    int written;
     size_t size;
     va_list args;
     char buf[4096];
@@ -161,11 +213,23 @@ static inline int flb_log_suppress_check(int log_suppress_interval, const char *
     }
 
     va_start(args, fmt);
-    size = vsnprintf(buf, sizeof(buf) - 1, fmt, args);
+    written = vsnprintf(buf, sizeof(buf) - 1, fmt, args);
     va_end(args);
 
-    if (size == -1) {
+    if (written < 0) {
         return FLB_FALSE;
+    }
+
+    /*
+     * vsnprintf() returns the length the message would have had, not what it
+     * wrote, so a message longer than the buffer is truncated while the return
+     * value is not. Passing that length on makes the suppression cache read
+     * past the end of this stack frame. Clamp to what actually landed in buf:
+     * vsnprintf() writes at most (sizeof(buf) - 1) - 1 characters plus a NUL.
+     */
+    size = (size_t) written;
+    if (size > sizeof(buf) - 2) {
+        size = sizeof(buf) - 2;
     }
 
     w = flb_worker_get();
@@ -173,7 +237,8 @@ static inline int flb_log_suppress_check(int log_suppress_interval, const char *
         return FLB_FALSE;
     }
 
-    ret = flb_log_cache_check_suppress(w->log_cache, buf, size);
+    ret = flb_log_cache_check_suppress_interval(w->log_cache, buf, size,
+                                                log_suppress_interval);
     return ret;
 }
 

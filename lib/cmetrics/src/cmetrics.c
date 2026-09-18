@@ -25,10 +25,12 @@
 #include <cmetrics/cmt_gauge.h>
 #include <cmetrics/cmt_summary.h>
 #include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_exp_histogram.h>
 #include <cmetrics/cmt_untyped.h>
 #include <cmetrics/cmt_atomic.h>
 #include <cmetrics/cmt_compat.h>
 #include <cmetrics/cmt_label.h>
+#include <cmetrics/cmt_map.h>
 #include <cmetrics/cmt_version.h>
 
 #include <cfl/cfl_kvlist.h>
@@ -76,6 +78,7 @@ struct cmt *cmt_create()
     cfl_list_init(&cmt->counters);
     cfl_list_init(&cmt->gauges);
     cfl_list_init(&cmt->histograms);
+    cfl_list_init(&cmt->exp_histograms);
     cfl_list_init(&cmt->summaries);
     cfl_list_init(&cmt->untypeds);
 
@@ -94,6 +97,7 @@ void cmt_destroy(struct cmt *cmt)
     struct cmt_gauge *g;
     struct cmt_summary *s;
     struct cmt_histogram *h;
+    struct cmt_exp_histogram *eh;
     struct cmt_untyped *u;
 
     cfl_list_foreach_safe(head, tmp, &cmt->counters) {
@@ -116,6 +120,11 @@ void cmt_destroy(struct cmt *cmt)
         cmt_histogram_destroy(h);
     }
 
+    cfl_list_foreach_safe(head, tmp, &cmt->exp_histograms) {
+        eh = cfl_list_entry(head, struct cmt_exp_histogram, _head);
+        cmt_exp_histogram_destroy(eh);
+    }
+
     cfl_list_foreach_safe(head, tmp, &cmt->untypeds) {
         u = cfl_list_entry(head, struct cmt_untyped, _head);
         cmt_untyped_destroy(u);
@@ -134,6 +143,61 @@ void cmt_destroy(struct cmt *cmt)
     }
 
     free(cmt);
+}
+
+void cmt_expire(struct cmt *cmt, uint64_t expiration)
+{
+    struct cfl_list *tmp;
+    struct cfl_list *head;
+    struct cmt_counter *counter;
+    struct cmt_gauge *gauge;
+    struct cmt_summary *summary;
+    struct cmt_histogram *histogram;
+    struct cmt_untyped *untyped;
+    struct cmt_exp_histogram *exp_histogram;
+
+    if (cmt == NULL) {
+        return;
+    }
+
+    /* Do a first pass for all regular metrics: 
+     *  * counters
+     *  * gauges
+     *  * summaries
+     *  * histograms
+     *  * untypeds
+     */
+    cfl_list_foreach_safe(head, tmp, &cmt->counters) {
+        counter = cfl_list_entry(head, struct cmt_counter, _head);
+        cmt_map_metrics_expire(counter->map, expiration);
+    }
+
+    cfl_list_foreach_safe(head, tmp, &cmt->gauges) {
+        gauge = cfl_list_entry(head, struct cmt_gauge, _head);
+        cmt_map_metrics_expire(gauge->map, expiration);
+    }
+
+    cfl_list_foreach_safe(head, tmp, &cmt->summaries) {
+        summary = cfl_list_entry(head, struct cmt_summary, _head);
+        cmt_map_metrics_expire(summary->map, expiration);
+    }
+
+    cfl_list_foreach_safe(head, tmp, &cmt->histograms) {
+        histogram = cfl_list_entry(head, struct cmt_histogram, _head);
+        cmt_map_metrics_expire(histogram->map, expiration);
+    }
+
+    cfl_list_foreach_safe(head, tmp, &cmt->untypeds) {
+        untyped = cfl_list_entry(head, struct cmt_untyped, _head);
+        cmt_map_metrics_expire(untyped->map, expiration);
+    }
+
+    /* Here we cover exp_histograms separetely.
+     */
+    cfl_list_foreach_safe(head, tmp, &cmt->exp_histograms) {
+        exp_histogram = cfl_list_entry(head, struct cmt_exp_histogram, _head);
+        cmt_map_metrics_expire(exp_histogram->map, expiration);
+    }
 }
 
 int cmt_label_add(struct cmt *cmt, char *key, char *val)

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -48,6 +48,7 @@ struct flb_systemd_config {
     sd_journal *j;       /* Journal context */
     char *cursor;
     flb_sds_t path;
+    flb_sds_t journal_namespace;
     flb_sds_t filter_type; /* sysytemd filter type: and|or */
     struct mk_list *systemd_filters;
     int pending_records;

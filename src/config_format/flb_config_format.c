@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -150,7 +150,24 @@ struct flb_cf *flb_cf_create()
 
 void flb_cf_destroy(struct flb_cf *cf)
 {
-    flb_kv_release(&cf->env);
+    struct flb_cf_env_var *ev;
+    struct mk_list *tmp;
+    struct mk_list *head;
+
+    mk_list_foreach_safe(head, tmp, &cf->env) {
+        ev = mk_list_entry(head, struct flb_cf_env_var, _head);
+        if (ev->name) {
+            flb_sds_destroy(ev->name);
+        }
+        if (ev->value) {
+            flb_sds_destroy(ev->value);
+        }
+        if (ev->uri) {
+            flb_sds_destroy(ev->uri);
+        }
+        flb_free(ev);
+    }
+    mk_list_init(&cf->env);
     flb_kv_release(&cf->metas);
     flb_cf_section_destroy_all(cf);
     flb_free(cf);
@@ -170,40 +187,56 @@ int flb_cf_set_origin_format(struct flb_cf *cf, int format)
     return 0;
 }
 
+static int section_name_check(char *name, int len, const char *expected)
+{
+    size_t expected_length;
+
+    expected_length = strlen(expected);
+    if (len < 0 || (size_t) len != expected_length) {
+        return FLB_FALSE;
+    }
+
+    if (strncasecmp(name, expected, expected_length) == 0) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
 static enum section_type get_section_type(char *name, int len)
 {
-    if (strncasecmp(name, "service", len) == 0) {
+    if (section_name_check(name, len, "service") == FLB_TRUE) {
         return FLB_CF_SERVICE;
     }
-    else if (strncasecmp(name, "parser", len) == 0) {
+    else if (section_name_check(name, len, "parser") == FLB_TRUE) {
         return FLB_CF_PARSER;
     }
-    else if (strncasecmp(name, "multiline_parser", len) == 0) {
+    else if (section_name_check(name, len, "multiline_parser") == FLB_TRUE) {
         return FLB_CF_MULTILINE_PARSER;
     }
-    else if (strncasecmp(name, "stream_processor", len) == 0) {
+    else if (section_name_check(name, len, "stream_processor") == FLB_TRUE) {
         return FLB_CF_STREAM_PROCESSOR;
     }
-    else if (strncasecmp(name, "plugins", len) == 0) {
+    else if (section_name_check(name, len, "plugins") == FLB_TRUE) {
         return FLB_CF_PLUGINS;
     }
-    else if (strncasecmp(name, "upstream_servers", len) == 0) {
+    else if (section_name_check(name, len, "upstream_servers") == FLB_TRUE) {
         return FLB_CF_UPSTREAM_SERVERS;
     }
-    else if (strncasecmp(name, "custom", len) == 0 ||
-             strncasecmp(name, "customs", len) == 0) {
+    else if (section_name_check(name, len, "custom") == FLB_TRUE ||
+             section_name_check(name, len, "customs") == FLB_TRUE) {
         return FLB_CF_CUSTOM;
     }
-    else if (strncasecmp(name, "input", len) == 0 ||
-             strncasecmp(name, "inputs", len) == 0) {
+    else if (section_name_check(name, len, "input") == FLB_TRUE ||
+             section_name_check(name, len, "inputs") == FLB_TRUE) {
         return FLB_CF_INPUT;
     }
-    else if (strncasecmp(name, "filter", len) == 0 ||
-             strncasecmp(name, "filters", len) == 0) {
+    else if (section_name_check(name, len, "filter") == FLB_TRUE ||
+             section_name_check(name, len, "filters") == FLB_TRUE) {
         return FLB_CF_FILTER;
     }
-    else if (strncasecmp(name, "output", len) == 0 ||
-             strncasecmp(name, "outputs", len) == 0) {
+    else if (section_name_check(name, len, "output") == FLB_TRUE ||
+             section_name_check(name, len, "outputs") == FLB_TRUE) {
         return FLB_CF_OUTPUT;
     }
 
@@ -325,6 +358,44 @@ key_error:
     return NULL;
 }
 
+struct cfl_variant *flb_cf_section_property_add_variant(struct flb_cf *cf,
+                                                        struct cfl_kvlist *kv_list,
+                                                        char *k_buf, size_t k_len,
+                                                        struct cfl_variant *variant)
+{
+    int rc;
+    flb_sds_t key;
+
+    if (variant == NULL) {
+        return NULL;
+    }
+
+    if (k_len == 0) {
+        k_len = strlen(k_buf);
+    }
+
+    key = flb_cf_key_translate(cf, k_buf, k_len);
+    if (key == NULL) {
+        return NULL;
+    }
+
+    rc = flb_sds_trim(key);
+    if (rc == -1) {
+        flb_cf_error_set(cf, FLB_CF_ERROR_KV_INVALID_KEY);
+        flb_sds_destroy(key);
+        return NULL;
+    }
+
+    rc = cfl_kvlist_insert(kv_list, key, variant);
+    if (rc < 0) {
+        flb_sds_destroy(key);
+        return NULL;
+    }
+
+    flb_sds_destroy(key);
+    return variant;
+}
+
 struct cfl_array *flb_cf_section_property_add_list(struct flb_cf *cf,
                                                    struct cfl_kvlist *kv_list,
                                                    char *k_buf, size_t k_len)
@@ -421,41 +492,81 @@ struct cfl_variant * flb_cf_section_property_get(struct flb_cf *cf, struct flb_c
     return cfl_kvlist_fetch(s->properties, key);
 }
 
-struct flb_kv *flb_cf_env_property_add(struct flb_cf *cf,
-                                       char *k_buf, size_t k_len,
-                                       char *v_buf, size_t v_len)
+struct flb_cf_env_var *flb_cf_env_var_add(struct flb_cf *cf,
+                                          char *name, size_t name_len,
+                                          char *value, size_t value_len,
+                                          char *uri, size_t uri_len,
+                                          int refresh_interval)
 {
-    int ret;
-    struct flb_kv *kv;
+    struct flb_cf_env_var *ev;
 
-    if (k_len == 0) {
-        k_len = strlen(k_buf);
+    if (name_len == 0 && name) {
+        name_len = strlen(name);
     }
-    if (v_len == 0) {
-        v_len = strlen(v_buf);
+    if (value_len == 0 && value) {
+        value_len = strlen(value);
+    }
+    if (uri_len == 0 && uri) {
+        uri_len = strlen(uri);
     }
 
-    kv = flb_kv_item_create_len(&cf->env, k_buf, k_len, v_buf, v_len);
-    if (!kv) {
+    ev = flb_calloc(1, sizeof(struct flb_cf_env_var));
+    if (!ev) {
         return NULL;
     }
 
-    /* sanitize key and value by removing empty spaces */
-    ret = flb_sds_trim(kv->key);
-    if (ret == -1) {
-        flb_cf_error_set(cf, FLB_CF_ERROR_KV_INVALID_KEY);
-        flb_kv_item_destroy(kv);
-        return NULL;
+    if (name) {
+        ev->name = flb_sds_create_len(name, name_len);
+        if (!ev->name) {
+            flb_free(ev);
+            return NULL;
+        }
     }
 
-    ret = flb_sds_trim(kv->val);
-    if (ret == -1) {
-        flb_cf_error_set(cf, FLB_CF_ERROR_KV_INVALID_VAL);
-        flb_kv_item_destroy(kv);
-        return NULL;
+    if (value) {
+        ev->value = flb_sds_create_len(value, value_len);
+        if (!ev->value) {
+            if (ev->name) {
+                flb_sds_destroy(ev->name);
+            }
+            flb_free(ev);
+            return NULL;
+        }
     }
 
-    return kv;
+    if (uri) {
+        ev->uri = flb_sds_create_len(uri, uri_len);
+        if (!ev->uri) {
+            if (ev->name) {
+                flb_sds_destroy(ev->name);
+            }
+            if (ev->value) {
+                flb_sds_destroy(ev->value);
+            }
+            if (ev->uri) {
+                flb_sds_destroy(ev->uri);
+            }
+            flb_free(ev);
+            return NULL;
+        }
+    }
+
+    ev->refresh_interval = refresh_interval;
+    mk_list_add(&ev->_head, &cf->env);
+
+    return ev;
+}
+
+struct flb_cf_env_var *flb_cf_env_property_add(struct flb_cf *cf,
+                                               char *name, size_t name_len,
+                                               char *value, size_t value_len,
+                                               char *uri, size_t uri_len,
+                                               int refresh_interval)
+{
+    return flb_cf_env_var_add(cf, name, name_len,
+                              value, value_len,
+                              uri, uri_len,
+                              refresh_interval);
 }
 
 static struct flb_kv *meta_property_add(struct flb_cf *cf,
@@ -827,7 +938,7 @@ static void dump_section(struct flb_cf_section *s)
 static void dump_env(struct mk_list *list)
 {
     struct mk_list *head;
-    struct flb_kv *kv;
+    struct flb_cf_env_var *ev;
 
     if (mk_list_size(list) == 0) {
         return;
@@ -836,8 +947,16 @@ static void dump_env(struct mk_list *list)
     printf("> env:\n");
 
     mk_list_foreach(head, list) {
-        kv = mk_list_entry(head, struct flb_kv, _head);
-        printf("    - %-15s: %s\n", kv->key, kv->val);
+        ev = mk_list_entry(head, struct flb_cf_env_var, _head);
+        if (ev->uri) {
+            printf("    - %-15s: %s\n", ev->name, ev->uri);
+        }
+        else if (ev->value) {
+            printf("    - %-15s: %s\n", ev->name, ev->value);
+        }
+        else {
+            printf("    - %-15s: (null)\n", ev->name);
+        }
     }
 }
 
@@ -911,4 +1030,3 @@ struct flb_cf *flb_cf_create_from_file(struct flb_cf *cf, char *file)
 
     return cf;
  }
-

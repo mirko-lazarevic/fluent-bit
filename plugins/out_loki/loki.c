@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_ra_key.h>
-#include <fluent-bit/flb_thread_storage.h>
+#include <fluent-bit/flb_pthread.h>
 #include <fluent-bit/record_accessor/flb_ra_parser.h>
 #include <fluent-bit/flb_mp.h>
 #include <fluent-bit/flb_log_event_decoder.h>
@@ -35,57 +35,20 @@
 
 #include "loki.h"
 
-struct flb_loki_dynamic_tenant_id_entry {
-    flb_sds_t value;
-    struct cfl_list _head;
+struct flb_loki_tenant_group {
+    flb_sds_t tenant_id;
+    int records;
+    struct mk_list _head;
 };
 
-pthread_once_t initialization_guard = PTHREAD_ONCE_INIT;
+#define FLB_LOKI_TENANT_GROUP_FLUSH_SUCCESS (((uint64_t) 1) << 0)
+#define FLB_LOKI_TENANT_GROUP_FLUSH_ERROR   (((uint64_t) 1) << 1)
+#define FLB_LOKI_TENANT_GROUP_FLUSH_RETRY   (((uint64_t) 1) << 2)
 
-FLB_TLS_DEFINE(struct flb_loki_dynamic_tenant_id_entry,
-               thread_local_tenant_id);
 struct flb_loki_remove_mpa_entry {
     struct flb_mp_accessor *mpa;
     struct cfl_list _head;
 };
-FLB_TLS_DEFINE(struct flb_loki_remove_mpa_entry, thread_local_remove_mpa);
-
-void initialize_thread_local_storage()
-{
-    FLB_TLS_INIT(thread_local_tenant_id);
-    FLB_TLS_INIT(thread_local_remove_mpa);
-}
-
-static struct flb_loki_dynamic_tenant_id_entry *dynamic_tenant_id_create() {
-    struct flb_loki_dynamic_tenant_id_entry *entry;
-
-    entry = (struct flb_loki_dynamic_tenant_id_entry *) \
-        flb_calloc(1, sizeof(struct flb_loki_dynamic_tenant_id_entry));
-
-    if (entry != NULL) {
-        entry->value = NULL;
-
-        cfl_list_entry_init(&entry->_head);
-    }
-
-    return entry;
-}
-
-static void dynamic_tenant_id_destroy(struct flb_loki_dynamic_tenant_id_entry *entry) {
-    if (entry != NULL) {
-        if (entry->value != NULL) {
-            flb_sds_destroy(entry->value);
-
-            entry->value = NULL;
-        }
-
-        if (!cfl_list_entry_is_orphan(&entry->_head)) {
-            cfl_list_del(&entry->_head);
-        }
-
-        flb_free(entry);
-    }
-}
 
 static struct flb_loki_remove_mpa_entry *remove_mpa_entry_create(struct flb_loki *ctx)
 {
@@ -477,7 +440,8 @@ static void pack_maps(struct flb_loki *ctx,
                         char *tag, int tag_len,
                         msgpack_object *map,
                         struct flb_mp_map_header *mh,
-                        struct mk_list *list)
+                        struct mk_list *list,
+                        struct flb_config *config)
 {
     struct mk_list *head;
     struct flb_loki_kv *kv;
@@ -539,7 +503,8 @@ static void pack_maps(struct flb_loki *ctx,
                          */
                         else {
                             accessed_map_val_json = flb_msgpack_to_json_str(1024,
-                                &accessed_map_kv.val);
+                                                                            &accessed_map_kv.val,
+                                                                            config->json_escape_unicode);
                             if (accessed_map_val_json) {
                                 msgpack_pack_str_with_body(mp_pck, accessed_map_val_json,
                                                          strlen(accessed_map_val_json));
@@ -556,14 +521,16 @@ static void pack_maps(struct flb_loki *ctx,
 static flb_sds_t pack_structured_metadata(struct flb_loki *ctx,
                                           msgpack_packer *mp_pck,
                                           char *tag, int tag_len,
-                                          msgpack_object *map)
+                                          msgpack_object *map,
+                                          struct flb_config *config)
 {
     struct flb_mp_map_header mh;
     /* Initialize dynamic map header */
     flb_mp_map_header_init(&mh, mp_pck);
     if (ctx->structured_metadata_map_keys) {
         pack_maps(ctx, mp_pck, tag, tag_len, map, &mh,
-                  &ctx->structured_metadata_map_keys_list);
+                  &ctx->structured_metadata_map_keys_list,
+                  config);
     }
     /*
      * explicit structured_metadata entries override
@@ -784,6 +751,11 @@ static int read_label_map_path_file(struct flb_output_instance *ins, flb_sds_t p
     struct stat st;
     size_t file_size;
     size_t ret_size;
+    const char *file_mode = "r";
+
+#ifdef FLB_SYSTEM_WINDOWS
+    file_mode = "rb";
+#endif
 
     ret = access(path, R_OK);
     if (ret < 0) {
@@ -800,7 +772,7 @@ static int read_label_map_path_file(struct flb_output_instance *ins, flb_sds_t p
     }
     file_size = st.st_size;
 
-    fp = fopen(path, "r");
+    fp = fopen(path, file_mode);
     if (fp == NULL) {
         flb_plg_error(ins, "can't open %s", path);
         return -1;
@@ -1224,6 +1196,22 @@ static struct flb_loki *loki_config_create(struct flb_output_instance *ins,
         return NULL;
     }
 
+    /* tenant_id_key split request error handling */
+    if (strcasecmp(ctx->tenant_id_key_error_handling, "partial_success") == 0) {
+        ctx->out_tenant_id_key_error_handling =
+            FLB_LOKI_TENANT_ID_KEY_ERROR_PARTIAL_SUCCESS;
+    }
+    else if (strcasecmp(ctx->tenant_id_key_error_handling, "partial_error") == 0) {
+        ctx->out_tenant_id_key_error_handling =
+            FLB_LOKI_TENANT_ID_KEY_ERROR_PARTIAL_ERROR;
+    }
+    else {
+        flb_plg_error(ctx->ins,
+                      "invalid 'tenant_id_key_error_handling' value: %s",
+                      ctx->tenant_id_key_error_handling);
+        return NULL;
+    }
+
     /* use TLS ? */
     if (ins->use_tls == FLB_TRUE) {
         io_flags = FLB_IO_TLS;
@@ -1355,26 +1343,28 @@ static void pack_format_line_value(flb_sds_t *buf, msgpack_object *val)
     }
 }
 
-// seek tenant id from map and set it to dynamic_tenant_id
-static int get_tenant_id_from_record(struct flb_loki *ctx, msgpack_object *map,
-                                     flb_sds_t *dynamic_tenant_id)
+static flb_sds_t get_tenant_id_from_record(struct flb_loki *ctx, msgpack_object *map,
+                                           int warn)
 {
     struct flb_ra_value *rval = NULL;
     flb_sds_t tmp_str;
-    int cmp_len;
 
     rval = flb_ra_get_value_object(ctx->ra_tenant_id_key, *map);
 
     if (rval == NULL) {
-        flb_plg_warn(ctx->ins, "the value of %s is missing",
-                     ctx->tenant_id_key_config);
-        return -1;
+        if (warn == FLB_TRUE) {
+            flb_plg_warn(ctx->ins, "the value of %s is missing",
+                         ctx->tenant_id_key_config);
+        }
+        return NULL;
     }
     else if (rval->o.type != MSGPACK_OBJECT_STR) {
-        flb_plg_warn(ctx->ins, "the value of %s is not string",
-                     ctx->tenant_id_key_config);
+        if (warn == FLB_TRUE) {
+            flb_plg_warn(ctx->ins, "the value of %s is not string",
+                         ctx->tenant_id_key_config);
+        }
         flb_ra_key_value_destroy(rval);
-        return -1;
+        return NULL;
     }
 
     tmp_str = flb_sds_create_len(rval->o.via.str.ptr,
@@ -1382,40 +1372,58 @@ static int get_tenant_id_from_record(struct flb_loki *ctx, msgpack_object *map,
     if (tmp_str == NULL) {
         flb_plg_warn(ctx->ins, "cannot create tenant ID string from record");
         flb_ra_key_value_destroy(rval);
-        return -1;
+        return NULL;
     }
-
-    // check if already dynamic_tenant_id is set.
-    if (*dynamic_tenant_id != NULL) {
-        cmp_len = flb_sds_len(*dynamic_tenant_id);
-
-        if ((rval->o.via.str.size == cmp_len) &&
-            flb_sds_cmp(tmp_str, *dynamic_tenant_id, cmp_len) == 0) {
-            // tenant_id is same. nothing to do.
-            flb_ra_key_value_destroy(rval);
-            flb_sds_destroy(tmp_str);
-
-            return 0;
-        }
-
-        flb_plg_warn(ctx->ins, "Tenant ID is overwritten %s -> %s",
-                     *dynamic_tenant_id, tmp_str);
-
-        flb_sds_destroy(*dynamic_tenant_id);
-    }
-
-    // this sds will be released after setting http header.
-    *dynamic_tenant_id = tmp_str;
-    flb_plg_debug(ctx->ins, "Tenant ID is %s", *dynamic_tenant_id);
 
     flb_ra_key_value_destroy(rval);
-    return 0;
+    return tmp_str;
+}
+
+static int tenant_id_matches(flb_sds_t left, flb_sds_t right)
+{
+    if (left == NULL && right == NULL) {
+        return FLB_TRUE;
+    }
+
+    if (left == NULL || right == NULL) {
+        return FLB_FALSE;
+    }
+
+    if (flb_sds_len(left) != flb_sds_len(right)) {
+        return FLB_FALSE;
+    }
+
+    if (flb_sds_cmp(left, right, flb_sds_len(left)) == 0) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+static flb_sds_t get_effective_tenant_id(struct flb_loki *ctx,
+                                         msgpack_object *record,
+                                         int warn)
+{
+    flb_sds_t tenant_id = NULL;
+
+    if (ctx->ra_tenant_id_key && record->type == MSGPACK_OBJECT_MAP) {
+        tenant_id = get_tenant_id_from_record(ctx, record, warn);
+    }
+
+    if (tenant_id == NULL && ctx->tenant_id != NULL) {
+        tenant_id = flb_sds_create_len(ctx->tenant_id, flb_sds_len(ctx->tenant_id));
+        if (tenant_id == NULL) {
+            flb_errno();
+        }
+    }
+
+    return tenant_id;
 }
 
 static int pack_record(struct flb_loki *ctx,
                        msgpack_packer *mp_pck, msgpack_object *rec,
-                       flb_sds_t *dynamic_tenant_id,
-                       struct flb_mp_accessor *remove_mpa)
+                       struct flb_mp_accessor *remove_mpa,
+                       struct flb_config *config)
 {
     int i;
     int skip = 0;
@@ -1430,14 +1438,6 @@ static int pack_record(struct flb_loki *ctx,
     size_t tmp_sbuf_size;
     msgpack_unpacked mp_buffer;
     size_t off = 0;
-
-    /*
-     * Get tenant id from record before removing keys.
-     * https://github.com/fluent/fluent-bit/issues/6207
-     */
-    if (ctx->ra_tenant_id_key && rec->type == MSGPACK_OBJECT_MAP) {
-        get_tenant_id_from_record(ctx, rec, dynamic_tenant_id);
-    }
 
     /* Remove keys in remove_keys */
     msgpack_unpacked_init(&mp_buffer);
@@ -1506,7 +1506,7 @@ static int pack_record(struct flb_loki *ctx,
     }
 
     if (ctx->out_line_format == FLB_LOKI_FMT_JSON) {
-        line = flb_msgpack_to_json_str(size_hint, rec);
+        line = flb_msgpack_to_json_str(size_hint, rec, config->json_escape_unicode);
         if (!line) {
             if (tmp_sbuf_data) {
                 flb_free(tmp_sbuf_data);
@@ -1582,32 +1582,6 @@ static int cb_loki_init(struct flb_output_instance *ins,
         return -1;
     }
 
-    result = pthread_mutex_init(&ctx->dynamic_tenant_list_lock, NULL);
-
-    if (result != 0) {
-        flb_errno();
-
-        flb_plg_error(ins, "cannot initialize dynamic tenant id list lock");
-
-        loki_config_destroy(ctx);
-
-        return -1;
-    }
-
-    result = pthread_once(&initialization_guard,
-                          initialize_thread_local_storage);
-
-    if (result != 0) {
-        flb_errno();
-
-        flb_plg_error(ins, "cannot initialize thread local storage");
-
-        loki_config_destroy(ctx);
-
-        return -1;
-    }
-
-    cfl_list_init(&ctx->dynamic_tenant_list);
     result = pthread_mutex_init(&ctx->remove_mpa_list_lock, NULL);
     if (result != 0) {
         flb_errno();
@@ -1617,6 +1591,21 @@ static int cb_loki_init(struct flb_output_instance *ins,
     }
 
     cfl_list_init(&ctx->remove_mpa_list);
+
+    /*
+     * Per-instance TLS key for the remove_mpa cache. Using a global TLS
+     * symbol here would let two loki outputs running on the same worker
+     * thread share the first instance's mpa and silently skip remove_keys
+     * for the second one.
+     */
+    result = pthread_key_create(&ctx->remove_mpa_key, NULL);
+    if (result != 0) {
+        flb_errno();
+        flb_plg_error(ins, "cannot create remove_mpa thread-local key");
+        loki_config_destroy(ctx);
+        return -1;
+    }
+    ctx->remove_mpa_key_initialized = FLB_TRUE;
 
     /*
      * This plugin instance uses the HTTP client interface, let's register
@@ -1634,8 +1623,10 @@ static flb_sds_t loki_compose_payload(struct flb_loki *ctx,
                                       int total_records,
                                       char *tag, int tag_len,
                                       const void *data, size_t bytes,
-                                      flb_sds_t *dynamic_tenant_id,
-                                      struct flb_mp_accessor *remove_mpa)
+                                      flb_sds_t tenant_filter,
+                                      int filter_tenant,
+                                      struct flb_mp_accessor *remove_mpa,
+                                      struct flb_config *config)
 {
     // int mp_ok = MSGPACK_UNPACK_SUCCESS;
     // size_t off = 0;
@@ -1647,6 +1638,8 @@ static flb_sds_t loki_compose_payload(struct flb_loki *ctx,
     // msgpack_object *obj;
     struct flb_log_event_decoder log_decoder;
     struct flb_log_event log_event;
+    flb_sds_t record_tenant_id;
+    int pack;
     int ret;
 
     /*
@@ -1721,14 +1714,27 @@ static flb_sds_t loki_compose_payload(struct flb_loki *ctx,
         while ((ret = flb_log_event_decoder_next(
                         &log_decoder,
                         &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+            pack = FLB_TRUE;
+            if (filter_tenant == FLB_TRUE) {
+                record_tenant_id = get_effective_tenant_id(ctx, log_event.body, FLB_FALSE);
+                pack = tenant_id_matches(record_tenant_id, tenant_filter);
+                if (record_tenant_id) {
+                    flb_sds_destroy(record_tenant_id);
+                }
+            }
+
+            if (pack == FLB_FALSE) {
+                continue;
+            }
+
             msgpack_pack_array(&mp_pck, ctx->structured_metadata ||
                                ctx->structured_metadata_map_keys ? 3 : 2);
 
             /* Append the timestamp */
             pack_timestamp(&mp_pck, &log_event.timestamp);
-            pack_record(ctx, &mp_pck, log_event.body, dynamic_tenant_id, remove_mpa);
+            pack_record(ctx, &mp_pck, log_event.body, remove_mpa, config);
             if (ctx->structured_metadata || ctx->structured_metadata_map_keys) {
-                pack_structured_metadata(ctx, &mp_pck, tag, tag_len, NULL);
+                pack_structured_metadata(ctx, &mp_pck, tag, tag_len, NULL, config);
             }
         }
     }
@@ -1743,6 +1749,19 @@ static flb_sds_t loki_compose_payload(struct flb_loki *ctx,
         while ((ret = flb_log_event_decoder_next(
                         &log_decoder,
                         &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+            pack = FLB_TRUE;
+            if (filter_tenant == FLB_TRUE) {
+                record_tenant_id = get_effective_tenant_id(ctx, log_event.body, FLB_FALSE);
+                pack = tenant_id_matches(record_tenant_id, tenant_filter);
+                if (record_tenant_id) {
+                    flb_sds_destroy(record_tenant_id);
+                }
+            }
+
+            if (pack == FLB_FALSE) {
+                continue;
+            }
+
             /* map content: streams['stream'] & streams['values'] */
             msgpack_pack_map(&mp_pck, 2);
 
@@ -1763,16 +1782,17 @@ static flb_sds_t loki_compose_payload(struct flb_loki *ctx,
 
             /* Append the timestamp */
             pack_timestamp(&mp_pck, &log_event.timestamp);
-            pack_record(ctx, &mp_pck, log_event.body, dynamic_tenant_id, remove_mpa);
+            pack_record(ctx, &mp_pck, log_event.body, remove_mpa, config);
             if (ctx->structured_metadata || ctx->structured_metadata_map_keys) {
-                pack_structured_metadata(ctx, &mp_pck, tag, tag_len, log_event.body);
+                pack_structured_metadata(ctx, &mp_pck, tag, tag_len, log_event.body, config);
             }
         }
     }
 
     flb_log_event_decoder_destroy(&log_decoder);
 
-    json = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size);
+    json = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size,
+                                       config->json_escape_unicode);
 
     msgpack_sbuffer_destroy(&mp_sbuf);
 
@@ -1789,91 +1809,119 @@ static void payload_release(void *payload, int compressed)
     }
 }
 
-static void cb_loki_flush(struct flb_event_chunk *event_chunk,
-                          struct flb_output_flush *out_flush,
-                          struct flb_input_instance *i_ins,
-                          void *out_context,
-                          struct flb_config *config)
+static struct flb_loki_tenant_group *tenant_group_get(struct mk_list *groups,
+                                                      flb_sds_t tenant_id)
+{
+    struct mk_list *head;
+    struct flb_loki_tenant_group *group;
+
+    mk_list_foreach(head, groups) {
+        group = mk_list_entry(head, struct flb_loki_tenant_group, _head);
+        if (tenant_id_matches(group->tenant_id, tenant_id) == FLB_TRUE) {
+            return group;
+        }
+    }
+
+    return NULL;
+}
+
+static void tenant_groups_destroy(struct mk_list *groups)
+{
+    struct mk_list *head;
+    struct mk_list *tmp;
+    struct flb_loki_tenant_group *group;
+
+    mk_list_foreach_safe(head, tmp, groups) {
+        group = mk_list_entry(head, struct flb_loki_tenant_group, _head);
+        mk_list_del(&group->_head);
+        if (group->tenant_id) {
+            flb_sds_destroy(group->tenant_id);
+        }
+        flb_free(group);
+    }
+}
+
+static int collect_tenant_groups(struct flb_loki *ctx,
+                                 const void *data, size_t bytes,
+                                 struct mk_list *groups)
+{
+    int ret;
+    flb_sds_t tenant_id;
+    struct flb_loki_tenant_group *group;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return -1;
+    }
+
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        tenant_id = get_effective_tenant_id(ctx, log_event.body, FLB_TRUE);
+        group = tenant_group_get(groups, tenant_id);
+        if (group == NULL) {
+            group = flb_calloc(1, sizeof(struct flb_loki_tenant_group));
+            if (group == NULL) {
+                if (tenant_id) {
+                    flb_sds_destroy(tenant_id);
+                }
+                flb_log_event_decoder_destroy(&log_decoder);
+                flb_errno();
+
+                return -1;
+            }
+
+            group->tenant_id = tenant_id;
+            group->records = 0;
+            mk_list_add(&group->_head, groups);
+        }
+        else if (tenant_id) {
+            flb_sds_destroy(tenant_id);
+        }
+
+        group->records++;
+    }
+
+    flb_log_event_decoder_destroy(&log_decoder);
+
+    return 0;
+}
+
+static int send_loki_payload(struct flb_loki *ctx,
+                             flb_sds_t payload,
+                             flb_sds_t tenant_id,
+                             struct flb_config *config)
 {
     int ret;
     int out_ret = FLB_OK;
-    size_t b_sent;
-    flb_sds_t payload = NULL;
-    flb_sds_t out_buf = NULL;
-    size_t out_size;
     int compressed = FLB_FALSE;
-    struct flb_loki *ctx = out_context;
+    size_t b_sent;
+    size_t out_size;
+    flb_sds_t out_buf;
     struct flb_connection *u_conn;
     struct flb_http_client *c;
-    struct flb_loki_dynamic_tenant_id_entry *dynamic_tenant_id;
-    struct flb_loki_remove_mpa_entry *remove_mpa_entry;
     struct mk_list *head;
     struct flb_config_map_val *mv;
     struct flb_slist_entry *key = NULL;
     struct flb_slist_entry *val = NULL;
-
-    dynamic_tenant_id = FLB_TLS_GET(thread_local_tenant_id);
-
-    remove_mpa_entry = FLB_TLS_GET(thread_local_remove_mpa);
-
-    if (remove_mpa_entry == NULL) {
-        remove_mpa_entry = remove_mpa_entry_create(ctx);
-        if (!remove_mpa_entry) {
-            flb_plg_error(ctx->ins, "cannot allocate remove_mpa entry");
-            FLB_OUTPUT_RETURN(FLB_RETRY);
-        }
-
-        FLB_TLS_SET(thread_local_remove_mpa, remove_mpa_entry);
-
-        pthread_mutex_lock(&ctx->remove_mpa_list_lock);
-        cfl_list_add(&remove_mpa_entry->_head, &ctx->remove_mpa_list);
-        pthread_mutex_unlock(&ctx->remove_mpa_list_lock);
-    }
-
-    if (dynamic_tenant_id == NULL) {
-        dynamic_tenant_id = dynamic_tenant_id_create();
-
-        if (dynamic_tenant_id == NULL) {
-            flb_errno();
-            flb_plg_error(ctx->ins, "cannot allocate dynamic tenant id");
-
-            FLB_OUTPUT_RETURN(FLB_RETRY);
-        }
-
-        FLB_TLS_SET(thread_local_tenant_id, dynamic_tenant_id);
-
-        pthread_mutex_lock(&ctx->dynamic_tenant_list_lock);
-
-        cfl_list_add(&dynamic_tenant_id->_head, &ctx->dynamic_tenant_list);
-
-        pthread_mutex_unlock(&ctx->dynamic_tenant_list_lock);
-    }
-
-    /* Format the data to the expected Newrelic Payload */
-    payload = loki_compose_payload(ctx,
-                                   event_chunk->total_events,
-                                   (char *) event_chunk->tag,
-                                   flb_sds_len(event_chunk->tag),
-                                   event_chunk->data, event_chunk->size,
-                                   &dynamic_tenant_id->value,
-                                   remove_mpa_entry->mpa);
-
-    if (!payload) {
-        flb_plg_error(ctx->ins, "cannot compose request payload");
-
-        FLB_OUTPUT_RETURN(FLB_RETRY);
-    }
 
     /* Map buffer */
     out_buf = payload;
     out_size = flb_sds_len(payload);
 
     if (ctx->compress_gzip == FLB_TRUE) {
-        ret = flb_gzip_compress((void *) payload, flb_sds_len(payload), (void **) &out_buf, &out_size);
+        ret = flb_gzip_compress((void *) payload, flb_sds_len(payload),
+                                (void **) &out_buf, &out_size);
         if (ret == -1) {
             flb_plg_error(ctx->ins,
                           "cannot gzip payload, disabling compression");
-        } else {
+        }
+        else {
             compressed = FLB_TRUE;
             /* payload is not longer needed */
             flb_sds_destroy(payload);
@@ -1887,7 +1935,7 @@ static void cb_loki_flush(struct flb_event_chunk *event_chunk,
 
         payload_release(out_buf, compressed);
 
-        FLB_OUTPUT_RETURN(FLB_RETRY);
+        return FLB_RETRY;
     }
 
     /* Create HTTP client context */
@@ -1897,11 +1945,10 @@ static void cb_loki_flush(struct flb_event_chunk *event_chunk,
                         NULL, 0);
     if (!c) {
         flb_plg_error(ctx->ins, "cannot create HTTP client context");
-
         payload_release(out_buf, compressed);
         flb_upstream_conn_release(u_conn);
 
-        FLB_OUTPUT_RETURN(FLB_RETRY);
+        return FLB_RETRY;
     }
 
     /* Set response buffer size */
@@ -1916,7 +1963,8 @@ static void cb_loki_flush(struct flb_event_chunk *event_chunk,
     /* Auth headers */
     if (ctx->http_user && ctx->http_passwd) { /* Basic */
         flb_http_basic_auth(c, ctx->http_user, ctx->http_passwd);
-    } else if (ctx->bearer_token) { /* Bearer token */
+    }
+    else if (ctx->bearer_token) {
         flb_http_bearer_auth(c, ctx->bearer_token);
     }
 
@@ -1939,17 +1987,11 @@ static void cb_loki_flush(struct flb_event_chunk *event_chunk,
         flb_http_set_content_encoding_gzip(c);
     }
 
-    /* Add X-Scope-OrgID header */
-    if (dynamic_tenant_id->value != NULL) {
+    if (tenant_id != NULL) {
         flb_http_add_header(c,
                             FLB_LOKI_HEADER_SCOPE, sizeof(FLB_LOKI_HEADER_SCOPE) - 1,
-                            dynamic_tenant_id->value,
-                            flb_sds_len(dynamic_tenant_id->value));
-    }
-    else if (ctx->tenant_id) {
-        flb_http_add_header(c,
-                            FLB_LOKI_HEADER_SCOPE, sizeof(FLB_LOKI_HEADER_SCOPE) - 1,
-                            ctx->tenant_id, flb_sds_len(ctx->tenant_id));
+                            tenant_id,
+                            flb_sds_len(tenant_id));
     }
 
     /* Send HTTP request */
@@ -1982,18 +2024,18 @@ static void cb_loki_flush(struct flb_event_chunk *event_chunk,
         else if (c->resp.status >= 500 && c->resp.status <= 599) {
             if (c->resp.payload) {
                 flb_plg_error(ctx->ins, "could not flush records to %s:%i"
-                            " HTTP status=%i",
-                            ctx->tcp_host, ctx->tcp_port, c->resp.status);
+                              " HTTP status=%i",
+                              ctx->tcp_host, ctx->tcp_port, c->resp.status);
                 flb_plg_trace(ctx->ins, "Response was:\n%s",
-                            c->resp.payload);
+                              c->resp.payload);
             }
             else {
                 flb_plg_error(ctx->ins, "could not flush records to %s:%i"
-                            " HTTP status=%i",
-                            ctx->tcp_host, ctx->tcp_port, c->resp.status);
+                              " HTTP status=%i",
+                              ctx->tcp_host, ctx->tcp_port, c->resp.status);
             }
             /*
-             * Server-side error occured, do not reuse this connection for retry.
+             * Server-side error occurred, do not reuse this connection for retry.
              * This could be an issue of Loki gateway.
              * Rather initiate new connection.
              */
@@ -2036,22 +2078,151 @@ static void cb_loki_flush(struct flb_event_chunk *event_chunk,
     flb_http_client_destroy(c);
     flb_upstream_conn_release(u_conn);
 
-    FLB_OUTPUT_RETURN(out_ret);
+    return out_ret;
 }
 
-static void release_dynamic_tenant_ids(struct cfl_list *dynamic_tenant_list)
+static uint64_t tenant_group_flush_status(int ret)
 {
-    struct cfl_list                         *iterator;
-    struct cfl_list                         *backup;
-    struct flb_loki_dynamic_tenant_id_entry *entry;
-
-    cfl_list_foreach_safe(iterator, backup, dynamic_tenant_list) {
-        entry = cfl_list_entry(iterator,
-                               struct flb_loki_dynamic_tenant_id_entry,
-                               _head);
-
-        dynamic_tenant_id_destroy(entry);
+    if (ret == FLB_OK) {
+        return FLB_LOKI_TENANT_GROUP_FLUSH_SUCCESS;
     }
+    else if (ret == FLB_RETRY) {
+        return FLB_LOKI_TENANT_GROUP_FLUSH_RETRY;
+    }
+
+    return FLB_LOKI_TENANT_GROUP_FLUSH_ERROR;
+}
+
+static int tenant_group_flush_result(struct flb_loki *ctx, uint64_t status)
+{
+    if (status == 0) {
+        return FLB_OK;
+    }
+
+    if ((status & FLB_LOKI_TENANT_GROUP_FLUSH_SUCCESS) == 0) {
+        if (status & FLB_LOKI_TENANT_GROUP_FLUSH_RETRY) {
+            return FLB_RETRY;
+        }
+
+        return FLB_ERROR;
+    }
+
+    if ((status & FLB_LOKI_TENANT_GROUP_FLUSH_RETRY) == 0 &&
+        (status & FLB_LOKI_TENANT_GROUP_FLUSH_ERROR) == 0) {
+        return FLB_OK;
+    }
+
+    if (ctx->out_tenant_id_key_error_handling ==
+        FLB_LOKI_TENANT_ID_KEY_ERROR_PARTIAL_SUCCESS) {
+        return FLB_OK;
+    }
+
+    return FLB_RETRY;
+}
+
+static void cb_loki_flush(struct flb_event_chunk *event_chunk,
+                          struct flb_output_flush *out_flush,
+                          struct flb_input_instance *i_ins,
+                          void *out_context,
+                          struct flb_config *config)
+{
+    int ret;
+    int out_ret = FLB_OK;
+    uint64_t tenant_group_status = 0;
+    flb_sds_t payload = NULL;
+    struct flb_loki *ctx = out_context;
+    struct flb_loki_remove_mpa_entry *remove_mpa_entry;
+    struct mk_list tenant_groups;
+    struct mk_list *head;
+    struct flb_loki_tenant_group *group;
+
+    remove_mpa_entry = pthread_getspecific(ctx->remove_mpa_key);
+
+    if (remove_mpa_entry == NULL) {
+        remove_mpa_entry = remove_mpa_entry_create(ctx);
+        if (!remove_mpa_entry) {
+            flb_plg_error(ctx->ins, "cannot allocate remove_mpa entry");
+            FLB_OUTPUT_RETURN(FLB_RETRY);
+        }
+
+        /*
+         * Publish the entry before linking it: if the key cannot be set the
+         * entry stays unreachable from this thread, and linking it anyway
+         * would leak one accessor per flush until the instance is destroyed.
+         */
+        ret = pthread_setspecific(ctx->remove_mpa_key, remove_mpa_entry);
+        if (ret != 0) {
+            flb_plg_error(ctx->ins,
+                          "cannot store remove_mpa entry in thread-local "
+                          "storage: %d", ret);
+            remove_mpa_entry_destroy(remove_mpa_entry);
+            FLB_OUTPUT_RETURN(FLB_RETRY);
+        }
+
+        pthread_mutex_lock(&ctx->remove_mpa_list_lock);
+        cfl_list_add(&remove_mpa_entry->_head, &ctx->remove_mpa_list);
+        pthread_mutex_unlock(&ctx->remove_mpa_list_lock);
+    }
+
+    if (ctx->ra_tenant_id_key == NULL) {
+        payload = loki_compose_payload(ctx,
+                                       event_chunk->total_events,
+                                       (char *) event_chunk->tag,
+                                       flb_sds_len(event_chunk->tag),
+                                       event_chunk->data, event_chunk->size,
+                                       NULL,
+                                       FLB_FALSE,
+                                       remove_mpa_entry->mpa,
+                                       config);
+
+        if (!payload) {
+            flb_plg_error(ctx->ins, "cannot compose request payload");
+
+            FLB_OUTPUT_RETURN(FLB_RETRY);
+        }
+
+        out_ret = send_loki_payload(ctx, payload, ctx->tenant_id, config);
+
+        FLB_OUTPUT_RETURN(out_ret);
+    }
+
+    mk_list_init(&tenant_groups);
+
+    ret = collect_tenant_groups(ctx, event_chunk->data, event_chunk->size, &tenant_groups);
+    if (ret != 0) {
+        tenant_groups_destroy(&tenant_groups);
+
+        FLB_OUTPUT_RETURN(FLB_RETRY);
+    }
+
+    mk_list_foreach(head, &tenant_groups) {
+        group = mk_list_entry(head, struct flb_loki_tenant_group, _head);
+
+        payload = loki_compose_payload(ctx,
+                                       group->records,
+                                       (char *) event_chunk->tag,
+                                       flb_sds_len(event_chunk->tag),
+                                       event_chunk->data, event_chunk->size,
+                                       group->tenant_id,
+                                       FLB_TRUE,
+                                       remove_mpa_entry->mpa,
+                                       config);
+
+        if (!payload) {
+            flb_plg_error(ctx->ins, "cannot compose request payload");
+            tenant_group_status |= FLB_LOKI_TENANT_GROUP_FLUSH_RETRY;
+            continue;
+        }
+
+        ret = send_loki_payload(ctx, payload, group->tenant_id, config);
+        tenant_group_status |= tenant_group_flush_status(ret);
+    }
+
+    out_ret = tenant_group_flush_result(ctx, tenant_group_status);
+
+    tenant_groups_destroy(&tenant_groups);
+
+    FLB_OUTPUT_RETURN(out_ret);
 }
 
 static void release_remove_mpa_entries(struct cfl_list *remove_mpa_list)
@@ -2077,17 +2248,16 @@ static int cb_loki_exit(void *data, struct flb_config *config)
         return 0;
     }
 
-    pthread_mutex_lock(&ctx->dynamic_tenant_list_lock);
-
-    release_dynamic_tenant_ids(&ctx->dynamic_tenant_list);
-
-    pthread_mutex_unlock(&ctx->dynamic_tenant_list_lock);
-
     pthread_mutex_lock(&ctx->remove_mpa_list_lock);
 
     release_remove_mpa_entries(&ctx->remove_mpa_list);
 
     pthread_mutex_unlock(&ctx->remove_mpa_list_lock);
+
+    if (ctx->remove_mpa_key_initialized == FLB_TRUE) {
+        pthread_key_delete(ctx->remove_mpa_key);
+        ctx->remove_mpa_key_initialized = FLB_FALSE;
+    }
 
     loki_config_destroy(ctx);
 
@@ -2118,6 +2288,14 @@ static struct flb_config_map config_map[] = {
     },
 
     {
+     FLB_CONFIG_MAP_STR, "tenant_id_key_error_handling", "partial_success",
+     0, FLB_TRUE, offsetof(struct flb_loki, tenant_id_key_error_handling),
+     "Set how tenant_id_key split request failures affect the whole chunk. "
+     "Options are 'partial_success' to treat mixed success and failure as "
+     "success, or 'partial_error' to retry mixed success and failure."
+    },
+
+    {
      FLB_CONFIG_MAP_CLIST, "labels", NULL,
      0, FLB_TRUE, offsetof(struct flb_loki, labels),
      "labels for API requests. If no value is set, the default label is 'job=fluent-bit'"
@@ -2128,7 +2306,7 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_loki, structured_metadata),
      "optional structured metadata fields for API requests."
     },
-    
+
     {
      FLB_CONFIG_MAP_CLIST, "structured_metadata_map_keys", NULL,
      0, FLB_TRUE, offsetof(struct flb_loki, structured_metadata_map_keys),
@@ -2230,23 +2408,18 @@ static int cb_loki_format_test(struct flb_config *config,
 {
     int total_records;
     flb_sds_t payload = NULL;
-    flb_sds_t dynamic_tenant_id;
     struct flb_loki *ctx = plugin_context;
 
-    dynamic_tenant_id = NULL;
-
     /* Count number of records */
-    total_records = flb_mp_count(data, bytes);
+    total_records = flb_mp_count_log_records(data, bytes);
 
     payload = loki_compose_payload(ctx, total_records,
                                    (char *) tag, tag_len, data, bytes,
-                                   &dynamic_tenant_id,
-                                   ctx->remove_mpa);
+                                   NULL,
+                                   FLB_FALSE,
+                                   ctx->remove_mpa,
+                                   config);
     if (payload == NULL) {
-        if (dynamic_tenant_id != NULL) {
-            flb_sds_destroy(dynamic_tenant_id);
-        }
-
         return -1;
     }
 

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -129,7 +129,7 @@ static int str_to_regex(const char *pattern, OnigRegex *reg)
 
     option = check_option(start, end, &new_end);
 
-    if (pattern[0] == '/' && pattern[len - 1] == '/') {
+    if (len > 1 && pattern[0] == '/' && pattern[len - 1] == '/') {
         start++;
         end--;
     }

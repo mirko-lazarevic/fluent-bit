@@ -26,11 +26,11 @@ Fluent Bit supports a wide array of platforms, including Linux, Windows, MacOS, 
 ## 📌 Roadmap & Maintenance
 
 We follow a fast-paced development cycle, with major releases every 3–4 months.
-The active development branch (`master`) is currently focused on **v4.1**.
+The `master` branch currently tracks **v5.1**, the current stable release series.
 
 For version-specific maintenance timelines and policies, see our [MAINTENANCE.md](https://github.com/fluent/fluent-bit/blob/master/MAINTENANCE.md).
 
-To track upcoming milestones, visit the [project roadmap](https://github.com/fluent/fluent-bit/wiki/Roadmap).
+To track upcoming milestones, visit the [project roadmap](https://github.com/fluent/fluent-bit/wiki/Fluent-Bit-Roadmap).
 
 ---
 
@@ -66,7 +66,7 @@ make
 bin/fluent-bit -i cpu -o stdout -f 1
 ```
 
-More details: [Build & Install](https://docs.fluentbit.io/manual/installation/sources/build-and-install)
+More details: [Build & Install](https://docs.fluentbit.io/manual/installation/downloads/source/build-and-install)
 
 #### Requirements
 
@@ -78,10 +78,9 @@ More details: [Build & Install](https://docs.fluentbit.io/manual/installation/so
 
 ## Install Fluent Bit
 
-- [Linux packages (Debian, Ubuntu, RHEL, etc.)](https://docs.fluentbit.io/manual/installation/linux)
-- [Docker images](https://docs.fluentbit.io/manual/installation/docker)
-- [Windows binaries](https://docs.fluentbit.io/manual/installation/windows)
-- [IBM Z (s390x)](https://docs.fluentbit.io/manual/installation/linux/s390x)
+- [Linux packages (Debian, Ubuntu, RHEL, etc.)](https://docs.fluentbit.io/manual/installation/downloads/linux)
+- [Docker images](https://docs.fluentbit.io/manual/installation/downloads/docker)
+- [Windows binaries](https://docs.fluentbit.io/manual/installation/downloads/windows)
 
 ---
 
@@ -134,6 +133,6 @@ Fluent Bit is open to community contributions!
 
 ## Authors
 
-Fluent Bit is a CNCF sub-project, sponsored and maintained by major cloud providers and a growing community of contributors and maintainers from across the Cloud Native ecosystem.
+Fluent Bit is a CNCF graduated project, sponsored and maintained by major cloud providers and a growing community of contributors and maintainers from across the Cloud Native ecosystem.
 
 👉 [See Contributors](https://github.com/fluent/fluent-bit/graphs/contributors)

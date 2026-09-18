@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,14 +21,16 @@
 #define FLB_FILTER_MULTILINE_H
 
 #include <fluent-bit/flb_filter_plugin.h>
+#include <fluent-bit/flb_emitter.h>
 #include "ml_concat.h"
 
 #define FLB_MULTILINE_MEM_BUF_LIMIT_DEFAULT  "10M"
 #define FLB_MULTILINE_METRIC_EMITTED         200
+#define FLB_MULTILINE_METRIC_TRUNCATED       201
 #define FLB_MULTILINE_MODE_PARTIAL_MESSAGE   "partial_message"
 #define FLB_MULTILINE_MODE_PARSER            "parser"
 
-/* 
+/*
  * input instance + tag is the unique identifier
  * for a multiline stream
  * TODO: implement clean up of streams that haven't been used recently
@@ -67,6 +69,12 @@ struct ml_ctx {
 
     struct flb_filter_instance *ins;
 
+    struct flb_emitter_callbacks emitter_callbacks;
+
+    /* Shutdown-only gate for concurrent buffered parser callbacks. */
+    uint64_t active_callbacks;
+    uint64_t shutdown_flush_requested;
+
     /* emitter */
     flb_sds_t emitter_name;                 /* emitter input plugin name */
     flb_sds_t emitter_storage_type;         /* emitter storage type */
@@ -77,6 +85,7 @@ struct ml_ctx {
 
 #ifdef FLB_HAVE_METRICS
     struct cmt_counter *cmt_emitted;
+    struct cmt_counter *cmt_truncated;
 #endif
 };
 

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -247,8 +247,9 @@ int netprot_to_msgpack(char *buf, int len, struct mk_list *tdb,
         part_type = be16read(buf);
         part_len = be16read((unsigned char *) buf + 2);
 
-        if (len < part_len) {
-            flb_error("[in_collectd] data truncated (%i < %i)", len, part_len);
+        if (part_len < 4 || len < part_len) {
+            flb_error("[in_collectd] invalid part length (%i, remaining %i)",
+                      part_len, len);
             return -1;
         }
 
@@ -260,15 +261,15 @@ int netprot_to_msgpack(char *buf, int len, struct mk_list *tdb,
              part_type == PART_INTERVAL ||
              part_type == PART_INTERVAL_HR) &&
             size < sizeof(uint64_t)) {
-            flb_error("[in_collectd] data truncated (%i < %i)",
-                        size, sizeof(uint64_t));
+            flb_error("[in_collectd] data truncated (%i < %zu)",
+                      size, sizeof(uint64_t));
 
             return -1;
         }
 
         switch (part_type) {
             case PART_HOST:
-                if (ptr[size] == '\0') {
+                if (size > 0 && ptr[size - 1] == '\0') {
                     hdr.host = ptr;
                 }
                 break;
@@ -279,22 +280,22 @@ int netprot_to_msgpack(char *buf, int len, struct mk_list *tdb,
                 hdr.time = hr2time(be64read(ptr));
                 break;
             case PART_PLUGIN:
-                if (ptr[size] == '\0') {
+                if (size > 0 && ptr[size - 1] == '\0') {
                     hdr.plugin = ptr;
                 }
                 break;
             case PART_PLUGIN_INSTANCE:
-                if (ptr[size] == '\0') {
+                if (size > 0 && ptr[size - 1] == '\0') {
                     hdr.plugin_instance = ptr;
                 }
                 break;
             case PART_TYPE:
-                if (ptr[size] == '\0') {
+                if (size > 0 && ptr[size - 1] == '\0') {
                     hdr.type = ptr;
                 }
                 break;
             case PART_TYPE_INSTANCE:
-                if (ptr[size] == '\0') {
+                if (size > 0 && ptr[size - 1] == '\0') {
                     hdr.type_instance = ptr;
                 }
                 break;

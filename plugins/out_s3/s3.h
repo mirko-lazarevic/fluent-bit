@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,12 @@
 #include <fluent-bit/flb_aws_credentials.h>
 #include <fluent-bit/flb_aws_util.h>
 #include <fluent-bit/flb_blob_db.h>
+#include <fluent-bit/flb_pthread.h>
+
+/* S3 output format types */
+#define FLB_S3_FORMAT_JSON_LINES  0
+#define FLB_S3_FORMAT_PARQUET     100
+#define FLB_S3_FORMAT_ARROW       101
 
 /* Upload data to S3 in 5MB chunks */
 #define MIN_CHUNKED_UPLOAD_SIZE 5242880
@@ -48,6 +54,10 @@
 
 #define DEFAULT_UPLOAD_TIMEOUT 3600
 
+#define MAX_UPLOAD_ERRORS 5
+#define S3_RETRY_EXHAUSTED_DELETE     0
+#define S3_RETRY_EXHAUSTED_QUARANTINE 1
+
 /*
  * If we see repeated errors on an upload/chunk, we will discard it
  * This saves us from scenarios where something goes wrong and an upload can
@@ -56,20 +66,30 @@
  *
  * The same is done for chunks, just to be safe, even though realistically
  * I can't think of a reason why a chunk could become unsendable.
+ *
+ * The retry limit is now configurable via the retry_limit parameter.
  */
-#define MAX_UPLOAD_ERRORS 5
 
 struct upload_queue {
     struct s3_file *upload_file;
+    /* Non-owning reference; refresh it before every upload attempt. */
     struct multipart_upload *m_upload_file;
     flb_sds_t tag;
     int tag_len;
 
     int retry_counter;
     time_t upload_time;
+    uint64_t scan_id;
+    int in_flight;
 
     struct mk_list _head;
 };
+
+struct flb_s3;
+
+typedef struct flb_http_client *s3_request_fn(struct flb_s3 *ctx, int method,
+                                            const char *uri, const char *body, size_t body_size,
+                                            struct flb_aws_header *headers, size_t headers_count);
 
 struct multipart_upload {
     flb_sds_t s3_key;
@@ -96,9 +116,12 @@ struct multipart_upload {
 
     struct mk_list _head;
 
-    /* see note for MAX_UPLOAD_ERRORS */
+    /* see note for retry_limit configuration */
     int upload_errors;
     int complete_errors;
+    uint64_t completion_scan_id;
+    /* Multipart helpers own files_mutex; requests release/reacquire it for I/O. */
+    s3_request_fn *request;
 };
 
 struct flb_s3 {
@@ -110,6 +133,7 @@ struct flb_s3 {
     char *sts_endpoint;
     char *canned_acl;
     char *content_type;
+    char *retry_exhausted_action_str;
     char *storage_class;
     char *log_key;
     char *external_id;
@@ -119,10 +143,13 @@ struct flb_s3 {
     int use_put_object;
     int send_content_md5;
     int static_file_path;
+    int retry_exhausted_action;
     int compression;
+    int s3_format;
     int port;
     int insecure;
     size_t store_dir_limit_size;
+    size_t quarantine_dir_limit_size;
 
     struct flb_blob_db blob_db;
     flb_sds_t blob_database_file;
@@ -139,7 +166,8 @@ struct flb_s3 {
     struct flb_tls *authorization_endpoint_tls_context;
 
     /* track the total amount of buffered data */
-    size_t current_buffer_size;
+    uint64_t current_buffer_size;
+    uint64_t quarantine_buffer_size;
 
     struct flb_aws_provider *provider;
     struct flb_aws_provider *base_provider;
@@ -150,6 +178,7 @@ struct flb_s3 {
     struct flb_tls *client_tls;
 
     struct flb_aws_client *s3_client;
+    int out_format;
     int json_date_format;
     flb_sds_t json_date_key;
     flb_sds_t date_key;
@@ -160,13 +189,21 @@ struct flb_s3 {
     struct flb_fstore *fs;
     struct flb_fstore_stream *stream_active;  /* default active stream */
     struct flb_fstore_stream *stream_upload;  /* multipart upload stream */
+    struct flb_fstore_stream *stream_quarantine; /* retry-exhausted stream */
     struct flb_fstore_stream *stream_metadata; /* s3 metadata stream */
+    /* Protects store and upload state; owned requests run outside this mutex. */
+    pthread_mutex_t files_mutex;
+    int files_mutex_initialized;
+    struct mk_list upload_claims;
+    uint64_t upload_scan_id;
+    int blob_upload_in_progress;
 
     /*
      * used to track that unset buffers were found on startup that have not
      * been sent
      */
     int has_old_buffers;
+    int draining_backlog;
     /* old multipart uploads read on start up */
     int has_old_uploads;
 
@@ -175,6 +212,7 @@ struct flb_s3 {
     int preserve_data_ordering;
     int upload_queue_success;
     struct mk_list upload_queue;
+    struct flb_sched_timer *upload_queue_retry_timer;
 
     size_t file_size;
     size_t upload_chunk_size;
@@ -192,6 +230,11 @@ struct flb_s3 {
 
     struct flb_output_instance *ins;
 };
+
+struct flb_http_client *s3_request(struct flb_s3 *ctx,
+                                  int method, const char *uri,
+                                  const char *body, size_t body_size,
+                                  struct flb_aws_header *headers, size_t headers_count);
 
 int upload_part(struct flb_s3 *ctx, struct multipart_upload *m_upload,
                 char *body, size_t body_size, char *pre_signed_url);

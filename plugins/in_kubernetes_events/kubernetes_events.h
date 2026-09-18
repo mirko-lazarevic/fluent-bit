@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@
 
 #define DEFAULT_INTERVAL_SEC "0"
 #define DEFAULT_INTERVAL_NSEC "500000000"
+#define DEFAULT_WATCH_TIMEOUT "10m"
 
 /* Filter context */
 struct k8s_events {
@@ -36,6 +37,7 @@ struct k8s_events {
     int interval_sec;             /* interval collection time (Second)     */
     int interval_nsec;            /* interval collection time (Nanosecond) */
     int retention_time;           /* retention time limit, default 1 hour */
+    int watch_timeout;            /* watch request timeout */
 
     /* Configuration parameters */
     char *api_host;
@@ -66,9 +68,6 @@ struct k8s_events {
     /* Pre-formatted HTTP Authorization header value */
     char *auth;
     size_t auth_len;
-
-    int dns_retries;
-    int dns_wait_time;
 
     struct flb_tls *tls;
 

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,6 +35,12 @@
     "  resourceVersion INTEGER NOT NULL,"                               \
     "  created         INTEGER NOT NULL"                                \
     ");"
+
+#define SQL_CREATE_KUBERNETES_EVENTS_INDEXES                            \
+    "CREATE INDEX IF NOT EXISTS idx_in_kubernetes_events_uid "          \
+    "    ON in_kubernetes_events(uid);"                                 \
+    "CREATE INDEX IF NOT EXISTS idx_in_kubernetes_events_created "      \
+    "    ON in_kubernetes_events(created);"
 
 #define SQL_KUBERNETES_EVENT_EXISTS_BY_UID                              \
     "SELECT COUNT(id) "                                                 \

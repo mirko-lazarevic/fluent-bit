@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -58,7 +58,7 @@ static int filefd_update(struct flb_ne *ctx)
     struct flb_slist_entry *max;
 
     mk_list_init(&list);
-    ret = ne_utils_file_read_lines(ctx->path_procfs, "/sys/fs/file-nr", &list);
+    ret = ne_utils_file_read_lines(ctx, ctx->path_procfs, "/sys/fs/file-nr", &list);
     if (ret == -1) {
         return -1;
     }

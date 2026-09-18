@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -909,7 +909,7 @@ int flb_blob_db_file_part_insert(struct flb_blob_db *context,
     else {
         result = FLB_BLOB_DB_SUCCESS;
 
-        *out_id = sqlite3_last_insert_rowid(context->db);
+        *out_id = flb_sqldb_last_id(context->db);
     }
 
     sqlite3_clear_bindings(statement);

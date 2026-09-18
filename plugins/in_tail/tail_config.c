@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -109,6 +109,9 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
 #ifdef FLB_HAVE_SQLDB
     ctx->db_sync = 1;  /* sqlite sync 'normal' */
 #endif
+#ifdef FLB_SYSTEM_WINDOWS
+    ctx->windows_path_encoding = FLB_TAIL_WINDOWS_PATH_ENCODING_ANSI;
+#endif
 #ifdef FLB_HAVE_UNICODE_ENCODER
     ctx->preferred_input_encoding = FLB_UNICODE_ENCODING_UNSPECIFIED;
 #endif
@@ -170,7 +173,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
             if (sec == 0 && nsec == 0) {
                 flb_plg_error(ctx->ins, "invalid 'refresh_interval' config "
                               "value (%s)", tmp);
-                flb_free(ctx);
+                flb_tail_config_destroy(ctx);
                 return NULL;
             }
 
@@ -192,9 +195,27 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     /* Config: seconds interval to monitor file after rotation */
     if (ctx->rotate_wait <= 0) {
         flb_plg_error(ctx->ins, "invalid 'rotate_wait' config value");
-        flb_free(ctx);
+        flb_tail_config_destroy(ctx);
         return NULL;
     }
+
+#ifdef FLB_SYSTEM_WINDOWS
+    tmp = flb_input_get_property("windows.path_encoding", ins);
+    if (tmp) {
+        if (strcasecmp(tmp, "ansi") == 0) {
+            ctx->windows_path_encoding = FLB_TAIL_WINDOWS_PATH_ENCODING_ANSI;
+        }
+        else if (strcasecmp(tmp, "utf-8") == 0 ||
+                 strcasecmp(tmp, "utf8") == 0) {
+            ctx->windows_path_encoding = FLB_TAIL_WINDOWS_PATH_ENCODING_UTF8;
+        }
+        else {
+            flb_plg_error(ctx->ins, "invalid 'windows.path_encoding' value %s", tmp);
+            flb_tail_config_destroy(ctx);
+            return NULL;
+        }
+    }
+#endif
 
 #ifdef FLB_HAVE_UNICODE_ENCODER
     tmp = flb_input_get_property("unicode.encoding", ins);
@@ -215,7 +236,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         }
         else {
             flb_plg_error(ctx->ins, "invalid encoding 'unicode.encoding' value");
-            flb_free(ctx);
+            flb_tail_config_destroy(ctx);
             return NULL;
         }
     }
@@ -230,11 +251,20 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         }
         else {
             flb_plg_error(ctx->ins, "invalid encoding 'generic.encoding' value %s", tmp);
-            flb_free(ctx);
+            flb_tail_config_destroy(ctx);
             return NULL;
         }
     }
 
+#ifdef FLB_HAVE_UNICODE_ENCODER
+    if (ctx->preferred_input_encoding != FLB_UNICODE_ENCODING_UNSPECIFIED &&
+        ctx->generic_input_encoding_type != FLB_GENERIC_UNSPECIFIED) {
+        flb_plg_error(ctx->ins,
+                      "'unicode.encoding' and 'generic.encoding' cannot be specified at the same time");
+        flb_tail_config_destroy(ctx);
+        return NULL;
+    }
+#endif
 #ifdef FLB_HAVE_PARSER
     /* Config: multi-line support */
     if (ctx->multiline == FLB_TRUE) {
@@ -258,7 +288,7 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     /* Validate buffer limit */
     if (ctx->buf_chunk_size > ctx->buf_max_size) {
         flb_plg_error(ctx->ins, "buffer_max_size must be >= buffer_chunk");
-        flb_free(ctx);
+        flb_tail_config_destroy(ctx);
         return NULL;
     }
 
@@ -296,6 +326,13 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
     ctx->ignored_file_sizes = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE, 1000, 0);
     if (ctx->ignored_file_sizes == NULL) {
         flb_plg_error(ctx->ins, "could not create ignored file size hash table");
+        flb_tail_config_destroy(ctx);
+        return NULL;
+    }
+
+    ctx->aged_out_file_inodes = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE, 1000, 0);
+    if (ctx->aged_out_file_inodes == NULL) {
+        flb_plg_error(ctx->ins, "could not create aged out file inode hash table");
         flb_tail_config_destroy(ctx);
         return NULL;
     }
@@ -479,6 +516,26 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                                                 "Total number of rotated files",
                                                 1, (char *[]) {"name"});
 
+    ctx->cmt_multiline_truncated = \
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input",
+                               "multiline_truncated_total",
+                               "Total number of truncated occurences for multilines",
+                               1, (char *[]) {"name"});
+    ctx->cmt_long_line_truncated = \
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input",
+                               "long_line_truncated_total",
+                               "Total number of truncated occurences for long lines",
+                               1, (char *[]) {"name"});
+
+    ctx->cmt_long_line_skipped =
+            cmt_counter_create(ins->cmt,
+                               "fluentbit", "input",
+                               "long_line_skipped_total",
+                               "Total number of skipped occurences for long lines",
+                               1, (char *[]) {"name"});
+
     /* OLD metrics */
     flb_metrics_add(FLB_TAIL_METRIC_F_OPENED,
                     "files_opened", ctx->ins->metrics);
@@ -486,6 +543,12 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
                     "files_closed", ctx->ins->metrics);
     flb_metrics_add(FLB_TAIL_METRIC_F_ROTATED,
                     "files_rotated", ctx->ins->metrics);
+    flb_metrics_add(FLB_TAIL_METRIC_M_TRUNCATED,
+                    "multiline_truncated", ctx->ins->metrics);
+    flb_metrics_add(FLB_TAIL_METRIC_L_TRUNCATED,
+                    "long_line_truncated", ctx->ins->metrics);
+    flb_metrics_add(FLB_TAIL_METRIC_L_SKIPPED,
+                    "long_line_skipped", ctx->ins->metrics);
 #endif
 
     return ctx;
@@ -535,6 +598,10 @@ int flb_tail_config_destroy(struct flb_tail_config *config)
 
     if (config->ignored_file_sizes != NULL) {
         flb_hash_table_destroy(config->ignored_file_sizes);
+    }
+
+    if (config->aged_out_file_inodes != NULL) {
+        flb_hash_table_destroy(config->aged_out_file_inodes);
     }
 
     flb_free(config);

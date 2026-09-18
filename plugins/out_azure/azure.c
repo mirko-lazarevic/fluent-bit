@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -51,7 +51,8 @@ static int cb_azure_init(struct flb_output_instance *ins,
 static int azure_format(const void *in_buf, size_t in_bytes,
                         flb_sds_t tag, flb_sds_t *tag_val_out,
                         char **out_buf, size_t *out_size,
-                        struct flb_azure *ctx)
+                        struct flb_azure *ctx,
+                        struct flb_config *config)
 {
     int i;
     int array_size = 0;
@@ -75,7 +76,7 @@ static int azure_format(const void *in_buf, size_t in_bytes,
     int ret;
 
     /* Count number of items */
-    array_size = flb_mp_count(in_buf, in_bytes);
+    array_size = flb_mp_count_log_records(in_buf, in_bytes);
 
     ret = flb_log_event_decoder_init(&log_decoder, (char *) in_buf, in_bytes);
 
@@ -160,7 +161,8 @@ static int azure_format(const void *in_buf, size_t in_bytes,
         msgpack_sbuffer_destroy(&tmp_sbuf);
     }
 
-    record = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size);
+    record = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size,
+                                         config->json_escape_unicode);
     if (!record) {
         flb_errno();
 
@@ -193,6 +195,7 @@ static int build_headers(struct flb_http_client *c,
     size_t olen;
     flb_sds_t rfc1123date;
     flb_sds_t str_hash;
+    flb_sds_t tmp_sds;
     struct tm tm = {0};
     unsigned char hmac_hash[32] = {0};
     int result;
@@ -229,13 +232,48 @@ static int build_headers(struct flb_http_client *c,
     }
 
     len = snprintf(tmp, sizeof(tmp) - 1, "%zu\n", content_length);
-    flb_sds_cat(str_hash, "POST\n", 5);
-    flb_sds_cat(str_hash, tmp, len);
-    flb_sds_cat(str_hash, "application/json\n", 17);
-    flb_sds_cat(str_hash, "x-ms-date:", 10);
-    flb_sds_cat(str_hash, rfc1123date, flb_sds_len(rfc1123date));
-    flb_sds_cat(str_hash, "\n", 1);
-    flb_sds_cat(str_hash, FLB_AZURE_RESOURCE, sizeof(FLB_AZURE_RESOURCE) - 1);
+    tmp_sds = flb_sds_cat(str_hash, "POST\n", 5);
+    if (!tmp_sds) {
+        goto concat_error;
+    }
+    str_hash = tmp_sds;
+
+    tmp_sds = flb_sds_cat(str_hash, tmp, len);
+    if (!tmp_sds) {
+        goto concat_error;
+    }
+    str_hash = tmp_sds;
+
+    tmp_sds = flb_sds_cat(str_hash, "application/json\n", 17);
+    if (!tmp_sds) {
+        goto concat_error;
+    }
+    str_hash = tmp_sds;
+
+    tmp_sds = flb_sds_cat(str_hash, "x-ms-date:", 10);
+    if (!tmp_sds) {
+        goto concat_error;
+    }
+    str_hash = tmp_sds;
+
+    tmp_sds = flb_sds_cat(str_hash, rfc1123date, flb_sds_len(rfc1123date));
+    if (!tmp_sds) {
+        goto concat_error;
+    }
+    str_hash = tmp_sds;
+
+    tmp_sds = flb_sds_cat(str_hash, "\n", 1);
+    if (!tmp_sds) {
+        goto concat_error;
+    }
+    str_hash = tmp_sds;
+
+    tmp_sds = flb_sds_cat(str_hash, FLB_AZURE_RESOURCE,
+                          sizeof(FLB_AZURE_RESOURCE) - 1);
+    if (!tmp_sds) {
+        goto concat_error;
+    }
+    str_hash = tmp_sds;
 
     /* Authorization signature */
     result = flb_hmac_simple(FLB_HASH_SHA256,
@@ -289,6 +327,12 @@ static int build_headers(struct flb_http_client *c,
     flb_free(auth);
 
     return 0;
+
+concat_error:
+    flb_sds_destroy(rfc1123date);
+    flb_sds_destroy(str_hash);
+
+    return -1;
 }
 
 static void cb_azure_flush(struct flb_event_chunk *event_chunk,
@@ -317,7 +361,8 @@ static void cb_azure_flush(struct flb_event_chunk *event_chunk,
 
     /* Convert binary logs into a JSON payload */
     ret = azure_format(event_chunk->data, event_chunk->size,
-                      event_chunk->tag, &final_log_type, &buf_data, &buf_size, ctx);
+                       event_chunk->tag, &final_log_type, &buf_data, &buf_size, ctx,
+                       config);
     /* If cannot get matching record using log_type_prefix, use log_type directly */
     if (!final_log_type) {
         final_log_type = ctx->log_type;

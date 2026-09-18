@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_http_client.h>
+#include <fluent-bit/flb_http_client_debug.h>
 #include <fluent-bit/flb_signv4.h>
 #include <fluent-bit/flb_aws_util.h>
 #include <fluent-bit/flb_aws_credentials.h>
@@ -32,8 +33,36 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#define AWS_SERVICE_ENDPOINT_FORMAT            "%s.%s.amazonaws.com"
-#define AWS_SERVICE_ENDPOINT_BASE_LEN          15
+#define AWS_SERVICE_ENDPOINT_FORMAT            "%s.%s%s"
+#define AWS_SERVICE_ENDPOINT_SUFFIX_COM        ".amazonaws.com"
+#define AWS_SERVICE_ENDPOINT_SUFFIX_SC2S       ".sc2s.sgov.gov"
+#define AWS_SERVICE_ENDPOINT_SUFFIX_CSP        ".csp.hci.ic.gov"
+#define AWS_SERVICE_ENDPOINT_SUFFIX_C2S        ".c2s.ic.gov"
+#define AWS_SERVICE_ENDPOINT_SUFFIX_ADC_E      ".cloud.adc-e.uk"
+#define AWS_SERVICE_ENDPOINT_SUFFIX_EU         ".amazonaws.eu"
+#define AWS_SERVICE_ENDPOINT_SUFFIX_COM_CN     ".amazonaws.com.cn"
+
+/* Maps a region name prefix to its endpoint domain suffix. */
+struct flb_aws_endpoint_suffix {
+    const char *prefix;
+    const char *suffix;
+};
+
+/*
+ * Region prefix to domain suffix mapping for non-standard AWS region families.
+ * Matched via strncmp against the region string, so entries must be ordered
+ * most-specific first to prevent a shorter prefix (e.g. "us-iso-") from
+ * matching before a longer one (e.g. "us-isob-", "us-isof-").
+ */
+static const struct flb_aws_endpoint_suffix endpoint_suffixes[] = {
+    { "us-isob-", AWS_SERVICE_ENDPOINT_SUFFIX_SC2S },
+    { "us-isof-", AWS_SERVICE_ENDPOINT_SUFFIX_CSP },
+    { "us-iso-",  AWS_SERVICE_ENDPOINT_SUFFIX_C2S },
+    { "eu-isoe-", AWS_SERVICE_ENDPOINT_SUFFIX_ADC_E },
+    { "eusc-", AWS_SERVICE_ENDPOINT_SUFFIX_EU },
+    { "cn-", AWS_SERVICE_ENDPOINT_SUFFIX_COM_CN },
+    { NULL, NULL }
+};
 
 #define TAG_PART_DESCRIPTOR "$TAG[%d]"
 #define TAG_DESCRIPTOR "$TAG"
@@ -70,29 +99,35 @@ struct flb_http_client *request_do(struct flb_aws_client *aws_client,
                                    size_t dynamic_headers_len);
 
 /*
- * https://service.region.amazonaws.com(.cn)
+ * Constructs an AWS service endpoint of the form: service.region.<domain-suffix>
+ * The domain suffix is resolved via endpoint_suffixes[], defaulting to .amazonaws.com.
  */
 char *flb_aws_endpoint(char* service, char* region)
 {
     char *endpoint = NULL;
-    size_t len = AWS_SERVICE_ENDPOINT_BASE_LEN;
-    int is_cn = FLB_FALSE;
+    const char *domain_suffix = AWS_SERVICE_ENDPOINT_SUFFIX_COM;
+    size_t len;
     int bytes;
+    int i;
 
-
-    /* In the China regions, ".cn" is appended to the URL */
-    if (strcmp("cn-north-1", region) == 0) {
-        len += 3;
-        is_cn = FLB_TRUE;
-    }
-    if (strcmp("cn-northwest-1", region) == 0) {
-        len += 3;
-        is_cn = FLB_TRUE;
+    if (!service || !region) {
+        return NULL;
     }
 
-    len += strlen(service);
+    /* Walk the prefix table; first match wins */
+    for (i = 0; endpoint_suffixes[i].prefix != NULL; i++) {
+        if (strncmp(region, endpoint_suffixes[i].prefix,
+                    strlen(endpoint_suffixes[i].prefix)) == 0) {
+            domain_suffix = endpoint_suffixes[i].suffix;
+            break;
+        }
+    }
+
+    len = strlen(service);
+    len += 1; /* dot between service and region */
     len += strlen(region);
-    len++; /* null byte */
+    len += strlen(domain_suffix);
+    len += 1; /* null byte */
 
     endpoint = flb_calloc(len, sizeof(char));
     if (!endpoint) {
@@ -100,16 +135,11 @@ char *flb_aws_endpoint(char* service, char* region)
         return NULL;
     }
 
-    bytes = snprintf(endpoint, len, AWS_SERVICE_ENDPOINT_FORMAT, service, region);
-    if (bytes < 0) {
+    bytes = snprintf(endpoint, len, AWS_SERVICE_ENDPOINT_FORMAT, service, region, domain_suffix);
+    if (bytes < 0 || bytes >= len) {
         flb_errno();
         flb_free(endpoint);
         return NULL;
-    }
-
-    if (is_cn) {
-        memcpy(endpoint + bytes, ".cn", 3);
-        endpoint[bytes + 3] = '\0';
     }
 
     return endpoint;
@@ -268,6 +298,14 @@ struct flb_aws_client *flb_aws_client_create()
     client->client_vtable = &client_vtable;
     client->retry_requests = FLB_FALSE;
     client->debug_only = FLB_FALSE;
+#ifdef FLB_HAVE_HTTP_CLIENT_DEBUG
+    client->http_cb_ctx = flb_callback_create("aws client");
+    if (!client->http_cb_ctx) {
+        flb_errno();
+        flb_free(client);
+        return NULL;
+    }
+#endif
     return client;
 }
 
@@ -291,6 +329,11 @@ void flb_aws_client_destroy(struct flb_aws_client *aws_client)
         if (aws_client->extra_user_agent) {
             flb_sds_destroy(aws_client->extra_user_agent);
         }
+#ifdef FLB_HAVE_HTTP_CLIENT_DEBUG
+        if (aws_client->http_cb_ctx) {
+            flb_callback_destroy(aws_client->http_cb_ctx);
+        }
+#endif
         flb_free(aws_client);
     }
 }
@@ -303,16 +346,16 @@ int flb_aws_is_auth_error(char *payload, size_t payload_size)
         return FLB_FALSE;
     }
 
-    /* Fluent Bit calls the STS API which returns XML */
-    if (strcasestr(payload, "InvalidClientTokenId") != NULL) {
-        return FLB_TRUE;
-    }
-
-    if (strcasestr(payload, "AccessDenied") != NULL) {
-        return FLB_TRUE;
-    }
-
-    if (strcasestr(payload, "Expired") != NULL) {
+    /* STS, S3, and other AWS APIs return XML error responses */
+    if (strcasestr(payload, "InvalidClientTokenId") != NULL ||
+        strcasestr(payload, "AccessDenied") != NULL ||
+        strcasestr(payload, "Expired") != NULL ||
+        strcasestr(payload, "InvalidAccessKeyId") != NULL ||
+        strcasestr(payload, "SignatureDoesNotMatch") != NULL ||
+        strcasestr(payload, "InvalidToken") != NULL ||
+        strcasestr(payload, "InvalidSecurity") != NULL ||
+        strcasestr(payload, "TokenRefreshRequired") != NULL ||
+        strcasestr(payload, "InvalidSignature") != NULL) {
         return FLB_TRUE;
     }
 
@@ -329,6 +372,9 @@ int flb_aws_is_auth_error(char *payload, size_t payload_size)
             strcmp(error, "InvalidClientTokenId") == 0 ||
             strcmp(error, "InvalidToken") == 0 ||
             strcmp(error, "InvalidAccessKeyId") == 0 ||
+            strcmp(error, "InvalidSecurity") == 0 ||
+            strcmp(error, "TokenRefreshRequired") == 0 ||
+            strcmp(error, "InvalidSignature") == 0 ||
             strcmp(error, "UnrecognizedClientException") == 0) {
                 flb_sds_destroy(error);
             return FLB_TRUE;
@@ -385,6 +431,10 @@ struct flb_http_client *request_do(struct flb_aws_client *aws_client,
         }
         goto error;
     }
+
+#ifdef FLB_HAVE_HTTP_CLIENT_DEBUG
+    flb_http_client_debug_enable(c, aws_client->http_cb_ctx);
+#endif
 
     /* Increase the maximum HTTP response buffer size to fit large responses from AWS services */
     ret = flb_http_buffer_size(c, FLB_MAX_AWS_RESP_BUFFER_SIZE);
@@ -528,19 +578,23 @@ struct flb_http_client *request_do(struct flb_aws_client *aws_client,
         c = NULL;
     }
 
+    if (c != NULL) {
+        flb_http_client_detach_connection(c);
+    }
+
     flb_upstream_conn_release(u_conn);
     flb_sds_destroy(signature);
     return c;
 
 error:
-    if (u_conn) {
-        flb_upstream_conn_release(u_conn);
-    }
     if (signature) {
         flb_sds_destroy(signature);
     }
     if (c) {
         flb_http_client_destroy(c);
+    }
+    if (u_conn) {
+        flb_upstream_conn_release(u_conn);
     }
     return NULL;
 }

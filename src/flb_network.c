@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@
 #ifdef FLB_SYSTEM_WINDOWS
 #define poll WSAPoll
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #else
 #include <sys/poll.h>
 #endif
@@ -140,6 +141,7 @@ void flb_net_setup_init(struct flb_net_setup *net)
     net->dns_resolver = NULL;
     net->dns_prefer_ipv4 = FLB_FALSE;
     net->dns_prefer_ipv6 = FLB_FALSE;
+    net->share_port = FLB_FALSE;
     net->keepalive = FLB_TRUE;
     net->keepalive_idle_timeout = 30;
     net->keepalive_max_recycle = 0;
@@ -160,20 +162,26 @@ int flb_net_host_set(const char *plugin_name, struct flb_net_host *host, const c
     int len;
     int olen;
     const char *s, *e, *u;
+    const char *separator;
 
     memset(host, '\0', sizeof(struct flb_net_host));
 
     olen = strlen(address);
-    if (olen == strlen(plugin_name)) {
-        return 0;
+    separator = strstr(address, "://");
+    if (separator != NULL && separator != address) {
+        s = separator + 3;
     }
+    else {
+        if (olen == strlen(plugin_name)) {
+            return 0;
+        }
 
-    len = strlen(plugin_name) + 3;
-    if (olen < len) {
-        return -1;
+        len = strlen(plugin_name) + 3;
+        if (olen < len) {
+            return -1;
+        }
+        s = address + len;
     }
-
-    s = address + len;
     if (*s == '[') {
         /* IPv6 address (RFC 3986) */
         e = strchr(++s, ']');
@@ -230,16 +238,17 @@ int flb_net_socket_share_port(flb_sockfd_t fd)
     int on = 1;
     int ret;
 
-#ifdef SO_REUSEPORT
+#if defined(SO_REUSEPORT) && !defined(FLB_SYSTEM_WINDOWS)
     ret = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
-#else
-    ret = -1;
-#endif
-
     if (ret == -1) {
         flb_errno();
         return -1;
     }
+#else
+    (void) fd;
+    flb_error("shared listener ports are not supported on this platform");
+    return -1;
+#endif
 
     return 0;
 }
@@ -638,9 +647,9 @@ static int net_connect_async(int fd,
             }
 
             /* Connection is broken, not much to do here */
-#if ((defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L) ||    \
-     (defined(_XOPEN_SOURCE) || _XOPEN_SOURCE - 0L >= 600L)) &&     \
-  (!defined(_GNU_SOURCE))
+#ifdef __GLIBC__
+            str = strerror_r(error, so_error_buf, sizeof(so_error_buf));
+#else
             ret = strerror_r(error, so_error_buf, sizeof(so_error_buf));
             if (ret == 0) {
                 str = so_error_buf;
@@ -649,8 +658,6 @@ static int net_connect_async(int fd,
                 flb_errno();
                 return -1;
             }
-#else
-            str = strerror_r(error, so_error_buf, sizeof(so_error_buf));
 #endif
             flb_error("[net] TCP connection failed: %s:%i (%s)",
                       u->tcp_host, u->tcp_port, str);
@@ -1649,18 +1656,38 @@ flb_sockfd_t flb_net_server(const char *port, const char *listen_addr,
 {
     flb_sockfd_t fd = -1;
     int ret;
+    size_t listen_addr_len;
     struct addrinfo hints;
     struct addrinfo *res, *rp;
+    const char *normalized_listen_addr;
+    char *listen_addr_copy;
+
+    listen_addr_copy = NULL;
+    normalized_listen_addr = listen_addr;
+
+    if (listen_addr != NULL && listen_addr[0] == '[') {
+        listen_addr_len = strlen(listen_addr);
+
+        if (listen_addr_len >= 3 && listen_addr[listen_addr_len - 1] == ']') {
+            listen_addr_copy = flb_strndup(listen_addr + 1, listen_addr_len - 2);
+            if (listen_addr_copy != NULL) {
+                normalized_listen_addr = listen_addr_copy;
+            }
+        }
+    }
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    ret = getaddrinfo(listen_addr, port, &hints, &res);
+    ret = getaddrinfo(normalized_listen_addr, port, &hints, &res);
     if (ret != 0) {
         flb_warn("net_server: getaddrinfo(listen='%s:%s'): %s",
                  listen_addr, port, gai_strerror(ret));
+        if (listen_addr_copy != NULL) {
+            flb_free(listen_addr_copy);
+        }
         return -1;
     }
 
@@ -1671,8 +1698,9 @@ flb_sockfd_t flb_net_server(const char *port, const char *listen_addr,
             continue;
         }
 
-        if (share_port) {
-            flb_net_socket_share_port(fd);
+        if (share_port && flb_net_socket_share_port(fd) == -1) {
+            flb_socket_close(fd);
+            continue;
         }
 
         flb_net_socket_tcp_nodelay(fd);
@@ -1688,6 +1716,10 @@ flb_sockfd_t flb_net_server(const char *port, const char *listen_addr,
     }
     freeaddrinfo(res);
 
+    if (listen_addr_copy != NULL) {
+        flb_free(listen_addr_copy);
+    }
+
     if (rp == NULL) {
         return -1;
     }
@@ -1699,18 +1731,38 @@ flb_sockfd_t flb_net_server_udp(const char *port, const char *listen_addr, int s
 {
     flb_sockfd_t fd = -1;
     int ret;
+    size_t listen_addr_len;
     struct addrinfo hints;
     struct addrinfo *res, *rp;
+    const char *normalized_listen_addr;
+    char *listen_addr_copy;
+
+    listen_addr_copy = NULL;
+    normalized_listen_addr = listen_addr;
+
+    if (listen_addr != NULL && listen_addr[0] == '[') {
+        listen_addr_len = strlen(listen_addr);
+
+        if (listen_addr_len >= 3 && listen_addr[listen_addr_len - 1] == ']') {
+            listen_addr_copy = flb_strndup(listen_addr + 1, listen_addr_len - 2);
+            if (listen_addr_copy != NULL) {
+                normalized_listen_addr = listen_addr_copy;
+            }
+        }
+    }
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags = AI_PASSIVE;
 
-    ret = getaddrinfo(listen_addr, port, &hints, &res);
+    ret = getaddrinfo(normalized_listen_addr, port, &hints, &res);
     if (ret != 0) {
         flb_warn("net_server_udp: getaddrinfo(listen='%s:%s'): %s",
                  listen_addr, port, gai_strerror(ret));
+        if (listen_addr_copy != NULL) {
+            flb_free(listen_addr_copy);
+        }
         return -1;
     }
 
@@ -1721,8 +1773,9 @@ flb_sockfd_t flb_net_server_udp(const char *port, const char *listen_addr, int s
             continue;
         }
 
-        if (share_port) {
-            flb_net_socket_share_port(fd);
+        if (share_port && flb_net_socket_share_port(fd) == -1) {
+            flb_socket_close(fd);
+            continue;
         }
 
         ret = flb_net_bind_udp(fd, rp->ai_addr, rp->ai_addrlen);
@@ -1734,6 +1787,10 @@ flb_sockfd_t flb_net_server_udp(const char *port, const char *listen_addr, int s
         break;
     }
     freeaddrinfo(res);
+
+    if (listen_addr_copy != NULL) {
+        flb_free(listen_addr_copy);
+    }
 
     if (rp == NULL) {
         return -1;
@@ -1774,8 +1831,9 @@ flb_sockfd_t flb_net_server_unix(const char *listen_path,
 
         strncpy(address.sun_path, listen_path, sizeof(address.sun_path));
 
-        if (share_port) {
-            flb_net_socket_share_port(fd);
+        if (share_port && flb_net_socket_share_port(fd) == -1) {
+            flb_socket_close(fd);
+            return -1;
         }
 
         if (stream_mode) {
@@ -1866,10 +1924,14 @@ flb_sockfd_t flb_net_accept(flb_sockfd_t server_fd)
                         SOCK_NONBLOCK | SOCK_CLOEXEC);
 #else
     remote_fd = accept(server_fd, (struct sockaddr*)&sock_addr, &socket_size);
-    flb_net_socket_nonblocking(remote_fd);
+
+    if (remote_fd != FLB_INVALID_SOCKET) {
+        flb_net_socket_nonblocking(remote_fd);
+    }
 #endif
 
-    if (remote_fd == -1) {
+    if (remote_fd == FLB_INVALID_SOCKET &&
+        !FLB_WOULDBLOCK()) {
         perror("accept4");
     }
 

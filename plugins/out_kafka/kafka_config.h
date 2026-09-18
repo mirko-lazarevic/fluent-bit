@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,7 +26,13 @@
 #include <fluent-bit/flb_avro.h>
 #endif
 
+#include <fluent-bit/flb_pthread.h>
+#ifdef FLB_HAVE_PROTOBUF_ENCODER
+#include "kafka_protobuf.h"
+#endif
+
 #include <fluent-bit/flb_kafka.h>
+#include <fluent-bit/flb_upstream.h>
 #include <fluent-bit/aws/flb_aws_msk_iam.h>
 
 #define FLB_KAFKA_FMT_JSON            0
@@ -36,6 +42,9 @@
 #define FLB_KAFKA_FMT_AVRO            3
 #endif
 #define FLB_KAFKA_FMT_RAW             4
+#define FLB_KAFKA_FMT_OTLP_JSON       5
+#define FLB_KAFKA_FMT_OTLP_PROTO      6
+#define FLB_KAFKA_FMT_PROTOBUF        7
 #define FLB_KAFKA_TS_KEY              "@timestamp"
 #define FLB_KAFKA_QUEUE_FULL_RETRIES  "10"
 
@@ -53,6 +62,16 @@
 #define FLB_JSON_DATE_ISO8601     1
 #define FLB_JSON_DATE_ISO8601_NS  2
 #define FLB_JSON_DATE_ISO8601_FMT "%Y-%m-%dT%H:%M:%S"
+
+#ifdef FLB_HAVE_KAFKA_SCHEMA_REGISTRY
+struct flb_kafka_schema_registry_endpoint {
+    flb_sds_t host;
+    flb_sds_t uri;
+    int port;
+    struct flb_upstream *upstream;
+    struct mk_list _head;
+};
+#endif
 
 struct flb_kafka_topic {
     int name_len;
@@ -85,6 +104,8 @@ struct flb_out_kafka {
     int raw_log_key_len;
     char *raw_log_key;
 
+    int otlp_logs_partition_by_resource;
+
     /* Gelf Keys */
     struct flb_gelf_fields gelf_fields;
 
@@ -113,16 +134,27 @@ struct flb_out_kafka {
     /* Plugin instance */
     struct flb_output_instance *ins;
 
-#ifdef FLB_HAVE_AVRO_ENCODER
-    // avro serialization requires a schema
-    // the schema is stored in json in avro_schema_str
-    //
-    // optionally the schema ID can be stashed in the avro data stream
-    // the schema ID is stored in avro_schema_id
-    // this is common at this time with large kafka installations and schema registries
-    // flb_sds_t avro_schema_str;
-    // flb_sds_t avro_schema_id;
-    struct flb_avro_fields avro_fields;
+#ifdef FLB_HAVE_KAFKA_SCHEMA_REGISTRY
+    int32_t schema_id;
+    flb_sds_t schema_str;
+    flb_sds_t schema_registry_url;
+    flb_sds_t schema_registry_subject;
+    flb_sds_t schema_registry_version;
+    flb_sds_t schema_registry_http_user;
+    flb_sds_t schema_registry_http_passwd;
+    flb_sds_t schema_registry_bearer_token;
+    flb_sds_t schema_registry_framing;
+    int schema_registry_endpoint_count;
+    int schema_registry_endpoint_index;
+    struct mk_list schema_registry_endpoints;
+    pthread_mutex_t schema_registry_lock;
+    int schema_registry_lock_initialized;
+    int schema_registry_loading;
+    int schema_registry_ready;
+#ifdef FLB_HAVE_PROTOBUF_ENCODER
+    flb_sds_t protobuf_message;
+    struct flb_kafka_protobuf *protobuf;
+#endif
 #endif
 
 #ifdef FLB_HAVE_AWS_MSK_IAM
@@ -142,5 +174,15 @@ struct flb_out_kafka {
 struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
                                            struct flb_config *config);
 int flb_out_kafka_destroy(struct flb_out_kafka *ctx);
+
+#ifdef FLB_HAVE_KAFKA_SCHEMA_REGISTRY
+int flb_kafka_schema_registry_configure(struct flb_out_kafka *ctx,
+                                        struct flb_config *config);
+int flb_kafka_schema_registry_resolve(struct flb_out_kafka *ctx);
+int flb_kafka_schema_registry_parse_response(struct flb_out_kafka *ctx,
+                                             const char *payload,
+                                             size_t payload_size);
+void flb_kafka_schema_registry_destroy(struct flb_out_kafka *ctx);
+#endif
 
 #endif

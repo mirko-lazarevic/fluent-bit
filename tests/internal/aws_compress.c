@@ -4,6 +4,8 @@
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_gzip.h>
+#include <fluent-bit/flb_zstd.h>
+#include <fluent-bit/flb_snappy.h>
 
 #include <fluent-bit/aws/flb_aws_compress.h>
 #include "flb_tests_internal.h"
@@ -35,6 +37,20 @@ static void flb_aws_compress_test_cases(struct flb_aws_test_case *cases);
 static void flb_aws_compress_truncate_b64_test_cases__gzip_decode(
                                                     struct flb_aws_test_case *cases,
                                                     size_t max_out_len);
+static void flb_aws_compress_truncate_b64_test_cases__zstd_decode(
+                                                    struct flb_aws_test_case *cases,
+                                                    size_t max_out_len);
+static void flb_aws_compress_truncate_b64_test_cases__snappy_decode(
+                                                    struct flb_aws_test_case *cases,
+                                                    size_t max_out_len);
+
+/* Wrapper function to adapt flb_snappy_uncompress to test interface */
+static int flb_snappy_uncompress_wrapper(void *in_data, size_t in_len,
+                                         void **out_data, size_t *out_len)
+{
+    return flb_snappy_uncompress((char *) in_data, in_len,
+                                (char **) out_data, out_len);
+}
 
 /** ------ Test Cases ------ **/
 void test_compression_gzip()
@@ -53,6 +69,70 @@ void test_compression_gzip()
     flb_aws_compress_test_cases(cases);
 }
 
+void test_compression_zstd()
+{
+    struct flb_aws_test_case cases[] =
+    {
+        {
+            "zstd",
+            "hello hello hello hello hello hello",
+            "KLUv/SAjZQAAMGhlbGxvIAEAuUsR",
+            0
+        },
+        { 0 }
+    };
+
+    flb_aws_compress_test_cases(cases);
+}
+
+void test_compression_snappy()
+{
+    struct flb_aws_test_case cases[] =
+    {
+        {
+            "snappy",
+            "The quick brown fox jumps over the lazy dog",
+            "K6hUaGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9n",
+            0
+        },
+        { 0 }
+    };
+
+    flb_aws_compress_test_cases(cases);
+}
+
+void test_compression_snappy_return_value_normalization()
+{
+    /* This test verifies that the snappy wrapper correctly normalizes return values
+     * to conform to the AWS compression interface contract: -1 on error, 0 on success.
+     *
+     * The test uses the actual flb_aws_compression_compress function which internally
+     * uses the wrapper. We verify that successful compression returns exactly 0,
+     * demonstrating that the wrapper properly normalizes the return value.
+     */
+    int ret;
+    void *out_data = NULL;
+    size_t out_len = 0;
+    int compression_type;
+    char test_data[] = "test data for compression";
+
+    compression_type = flb_aws_compression_get_type("snappy");
+    TEST_CHECK(compression_type != -1);
+
+    /* Test successful compression - should return exactly 0 (not any other value) */
+    ret = flb_aws_compression_compress(compression_type, test_data,
+                                      strlen(test_data), &out_data, &out_len);
+    TEST_CHECK(ret == 0);
+    TEST_MSG("Expected return value 0 on success, got: %d", ret);
+    TEST_MSG("This verifies the wrapper returns 0 (not passthrough of underlying function)");
+
+    if (ret == 0 && out_data != NULL) {
+        TEST_CHECK(out_len > 0);
+        TEST_MSG("Compressed data length: %zu", out_len);
+        flb_free(out_data);
+    }
+}
+
 void test_b64_truncated_gzip()
 {
 struct flb_aws_test_case cases[] =
@@ -68,6 +148,38 @@ struct flb_aws_test_case cases[] =
 
     flb_aws_compress_truncate_b64_test_cases__gzip_decode(cases,
         41);
+}
+
+void test_b64_truncated_zstd()
+{
+struct flb_aws_test_case cases[] =
+    {
+        {
+            "zstd",
+            "hello hello hello hello hello hello",
+            "hello hello hello hello hello hello",
+            0 /* Expected ret */
+        },
+        { 0 }
+    };
+
+    flb_aws_compress_truncate_b64_test_cases__zstd_decode(cases,41);
+}
+
+void test_b64_truncated_snappy()
+{
+struct flb_aws_test_case cases[] =
+    {
+        {
+            "snappy",
+            "The quick brown fox jumps over the lazy dog",
+            "The quick brown fox jumps over the lazy dog",
+            0 /* Expected ret */
+        },
+        { 0 }
+    };
+
+    flb_aws_compress_truncate_b64_test_cases__snappy_decode(cases, 60);
 }
 
 void test_b64_truncated_gzip_truncation()
@@ -200,9 +312,241 @@ struct flb_aws_test_case cases[] =
         300);
 }
 
+void test_b64_truncated_gzip_boundary()
+{
+    /* Test the boundary condition where compressed output exactly matches max_out_len.
+     * This test verifies the fix for the off-by-one error where records at the exact
+     * limit were incorrectly truncated. Input is crafted to compress to exactly 40 bytes
+     * of base64 output (without null terminator). */
+    struct flb_aws_test_case cases[] =
+        {
+            {
+                "gzip",
+                "test",  /* Small input that compresses to ~40 bytes base64 */
+                "test",
+                0 /* Expected ret - should succeed without truncation */
+            },
+            { 0 }
+        };
+
+    /* Set max_out_len to exactly match the expected compressed size.
+     * With the fix, this should NOT trigger truncation. */
+    flb_aws_compress_truncate_b64_test_cases__gzip_decode(cases, 40);
+}
+
+#ifdef FLB_HAVE_ARROW_PARQUET
+void test_parquet_format_snappy()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_PARQUET,
+                                   json, json_len, &out_buf, &out_size,
+                                   FLB_AWS_COMPRESS_SNAPPY);
+    if (!TEST_CHECK(ret == 0 && out_buf != NULL && out_size >= 8)) {
+        TEST_MSG("Parquet SNAPPY conversion failed");
+        return;
+    }
+    TEST_CHECK(memcmp(out_buf, "PAR1", 4) == 0);
+    TEST_CHECK(memcmp((char *)out_buf + out_size - 4, "PAR1", 4) == 0);
+    flb_free(out_buf);
+}
+
+void test_parquet_format_zstd()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_PARQUET,
+                                   json, json_len, &out_buf, &out_size,
+                                   FLB_AWS_COMPRESS_ZSTD);
+    if (!TEST_CHECK(ret == 0 && out_buf != NULL && out_size >= 8)) {
+        TEST_MSG("Parquet ZSTD conversion failed");
+        return;
+    }
+    TEST_CHECK(memcmp(out_buf, "PAR1", 4) == 0);
+    TEST_CHECK(memcmp((char *)out_buf + out_size - 4, "PAR1", 4) == 0);
+    flb_free(out_buf);
+}
+
+void test_parquet_format_gzip()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_PARQUET,
+                                   json, json_len, &out_buf, &out_size,
+                                   FLB_AWS_COMPRESS_GZIP);
+    if (!TEST_CHECK(ret == 0 && out_buf != NULL && out_size >= 8)) {
+        TEST_MSG("Parquet GZIP conversion failed");
+        return;
+    }
+    TEST_CHECK(memcmp(out_buf, "PAR1", 4) == 0);
+    TEST_CHECK(memcmp((char *)out_buf + out_size - 4, "PAR1", 4) == 0);
+    flb_free(out_buf);
+}
+
+void test_parquet_format_uncompressed()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_PARQUET,
+                                   json, json_len, &out_buf, &out_size,
+                                   FLB_AWS_COMPRESS_NONE);
+    if (!TEST_CHECK(ret == 0 && out_buf != NULL && out_size >= 8)) {
+        TEST_MSG("Parquet NONE conversion failed");
+        return;
+    }
+    TEST_CHECK(memcmp(out_buf, "PAR1", 4) == 0);
+    TEST_CHECK(memcmp((char *)out_buf + out_size - 4, "PAR1", 4) == 0);
+    flb_free(out_buf);
+}
+
+void test_parquet_format_invalid_compression()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_PARQUET,
+                                                json, json_len,
+                                                &out_buf, &out_size, -1);
+    TEST_CHECK(ret == -1);
+    TEST_CHECK(out_buf == NULL);
+    TEST_CHECK(out_size == 0);
+}
+
+void test_parquet_compression_reduces_size()
+{
+    int ret;
+    void *buf_none = NULL;
+    void *buf_snappy = NULL;
+    size_t size_none = 0;
+    size_t size_snappy = 0;
+    char *json = "{\"msg\":\"hello hello hello hello hello hello\"}\n"
+                 "{\"msg\":\"hello hello hello hello hello hello\"}\n"
+                 "{\"msg\":\"hello hello hello hello hello hello\"}\n"
+                 "{\"msg\":\"hello hello hello hello hello hello\"}\n"
+                 "{\"msg\":\"hello hello hello hello hello hello\"}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_PARQUET,
+                                   json, json_len, &buf_none, &size_none,
+                                   FLB_AWS_COMPRESS_NONE);
+    if (!TEST_CHECK(ret == 0 && buf_none != NULL)) {
+        TEST_MSG("Parquet NONE conversion failed");
+        return;
+    }
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_PARQUET,
+                                   json, json_len, &buf_snappy, &size_snappy,
+                                   FLB_AWS_COMPRESS_SNAPPY);
+    if (!TEST_CHECK(ret == 0 && buf_snappy != NULL)) {
+        TEST_MSG("Parquet SNAPPY conversion failed");
+        flb_free(buf_none);
+        return;
+    }
+    TEST_CHECK(size_snappy <= size_none);
+
+    flb_free(buf_none);
+    flb_free(buf_snappy);
+}
+#endif
+
+#ifdef FLB_HAVE_ARROW
+void test_arrow_format_uncompressed()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_ARROW,
+                                   json, json_len, &out_buf, &out_size,
+                                   FLB_AWS_COMPRESS_NONE);
+    if (!TEST_CHECK(ret == 0 && out_buf != NULL && out_size >= 8)) {
+        TEST_MSG("Arrow NONE conversion failed");
+        return;
+    }
+    /* Arrow/Feather V2 files begin with the "ARROW1" magic */
+    TEST_CHECK(memcmp(out_buf, "ARROW1", 6) == 0);
+    flb_free(out_buf);
+}
+
+void test_arrow_format_zstd()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_ARROW,
+                                   json, json_len, &out_buf, &out_size,
+                                   FLB_AWS_COMPRESS_ZSTD);
+    if (!TEST_CHECK(ret == 0 && out_buf != NULL && out_size >= 8)) {
+        TEST_MSG("Arrow ZSTD conversion failed");
+        return;
+    }
+    TEST_CHECK(memcmp(out_buf, "ARROW1", 6) == 0);
+    flb_free(out_buf);
+}
+
+/*
+ * Arrow/Feather (Arrow IPC) only supports ZSTD compression. Codecs such as
+ * gzip must be rejected by the writer; out_s3 also rejects them at config
+ * time via validate_format_compression.
+ */
+void test_arrow_format_gzip_unsupported()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = flb_aws_compression_compress_columnar(FLB_AWS_COMPRESS_FORMAT_ARROW,
+                                   json, json_len, &out_buf, &out_size,
+                                   FLB_AWS_COMPRESS_GZIP);
+    TEST_CHECK(ret == -1);
+    if (out_buf != NULL) {
+        flb_free(out_buf);
+    }
+}
+#endif
+
 TEST_LIST = {
     { "test_compression_gzip", test_compression_gzip },
+    { "test_compression_zstd", test_compression_zstd },
+    { "test_compression_snappy", test_compression_snappy },
+    { "test_compression_snappy_return_value_normalization",
+      test_compression_snappy_return_value_normalization },
     { "test_b64_truncated_gzip", test_b64_truncated_gzip },
+    { "test_b64_truncated_zstd", test_b64_truncated_zstd },
+    { "test_b64_truncated_snappy", test_b64_truncated_snappy },
     { "test_b64_truncated_gzip_truncation", test_b64_truncated_gzip_truncation },
     { "test_b64_truncated_gzip_truncation_buffer_too_small",
       test_b64_truncated_gzip_truncation_buffer_too_small },
@@ -210,6 +554,23 @@ TEST_LIST = {
       test_b64_truncated_gzip_truncation_edge },
     { "test_b64_truncated_gzip_truncation_multi_rounds",
       test_b64_truncated_gzip_truncation_multi_rounds },
+    { "test_b64_truncated_gzip_boundary",
+      test_b64_truncated_gzip_boundary },
+#ifdef FLB_HAVE_ARROW_PARQUET
+    { "test_parquet_format_snappy", test_parquet_format_snappy },
+    { "test_parquet_format_zstd", test_parquet_format_zstd },
+    { "test_parquet_format_gzip", test_parquet_format_gzip },
+    { "test_parquet_format_uncompressed", test_parquet_format_uncompressed },
+    { "test_parquet_format_invalid_compression",
+      test_parquet_format_invalid_compression },
+    { "test_parquet_compression_reduces_size",
+      test_parquet_compression_reduces_size },
+#endif
+#ifdef FLB_HAVE_ARROW
+    { "test_arrow_format_uncompressed", test_arrow_format_uncompressed },
+    { "test_arrow_format_zstd", test_arrow_format_zstd },
+    { "test_arrow_format_gzip_unsupported", test_arrow_format_gzip_unsupported },
+#endif
     { 0 }
 };
 
@@ -229,6 +590,22 @@ static void flb_aws_compress_truncate_b64_test_cases__gzip_decode(
 {
    flb_aws_compress_general_test_cases(FLB_AWS_COMPRESS_TEST_TYPE_B64_TRUNCATE,
                                       cases, max_out_len, &flb_gzip_uncompress);
+}
+
+static void flb_aws_compress_truncate_b64_test_cases__zstd_decode(
+                                                        struct flb_aws_test_case *cases,
+                                                        size_t max_out_len)
+{
+   flb_aws_compress_general_test_cases(FLB_AWS_COMPRESS_TEST_TYPE_B64_TRUNCATE,
+                                      cases, max_out_len, &flb_zstd_uncompress);
+}
+
+static void flb_aws_compress_truncate_b64_test_cases__snappy_decode(
+                                                        struct flb_aws_test_case *cases,
+                                                        size_t max_out_len)
+{
+   flb_aws_compress_general_test_cases(FLB_AWS_COMPRESS_TEST_TYPE_B64_TRUNCATE,
+                                      cases, max_out_len, &flb_snappy_uncompress_wrapper);
 }
 
 /* General test case loop flb_aws_compress */
@@ -261,8 +638,8 @@ static void flb_aws_compress_general_test_cases(int test_type,
     while (tcase->compression_keyword != 0) {
 
         size_t in_data_len = strlen(tcase->in_data);
-        compression_type = flb_aws_compression_get_type(tcase->compression_keyword);   
-        
+        compression_type = flb_aws_compression_get_type(tcase->compression_keyword);
+
         TEST_CHECK(compression_type != -1);
         TEST_MSG("| flb_aws_get_compression_type: failed to get compression type for "
                  "keyword "

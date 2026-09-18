@@ -20,6 +20,10 @@
 #ifndef CMT_DECODE_PROMETHEUS_H
 #define CMT_DECODE_PROMETHEUS_H
 
+#include <cmetrics/cmt_info.h>
+
+#ifdef CMT_HAVE_PROMETHEUS_TEXT_DECODER
+
 #include <stdbool.h>
 
 #include <cmetrics/cmetrics.h>
@@ -64,6 +68,7 @@ struct cmt_decode_prometheus_context_metric {
     size_t label_count;
     cfl_sds_t labels[CMT_DECODE_PROMETHEUS_MAX_LABEL_COUNT];
     struct cfl_list samples;
+    char *name_buf;
 };
 
 struct cmt_decode_prometheus_parse_opts {
@@ -109,5 +114,7 @@ int cmt_decode_prometheus_create(
         size_t in_size,
         struct cmt_decode_prometheus_parse_opts *opts);
 void cmt_decode_prometheus_destroy(struct cmt *cmt);
+
+#endif /* CMT_HAVE_PROMETHEUS_TEXT_DECODER */
 
 #endif

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,35 @@
 #include "fw_conn.h"
 #include "fw_config.h"
 
+static void fw_destroy_shared_key(struct flb_in_fw_config *config)
+{
+    if (config->owns_shared_key && config->shared_key) {
+        flb_sds_destroy(config->shared_key);
+    }
+
+    config->shared_key = NULL;
+    config->owns_shared_key = FLB_FALSE;
+}
+
+static int fw_create_empty_shared_key(struct flb_in_fw_config *config,
+                                      struct flb_input_instance *i_ins)
+{
+    flb_sds_t empty_key = flb_sds_create("");
+    if (!empty_key) {
+        flb_plg_error(i_ins, "empty shared_key alloc failed");
+        return -1;
+    }
+    else {
+        if (config->owns_shared_key && config->shared_key) {
+            flb_sds_destroy(config->shared_key);
+        }
+        config->shared_key = empty_key;
+        config->owns_shared_key = FLB_TRUE;
+    }
+
+    return 0;
+}
+
 struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
 {
     char tmp[16];
@@ -39,6 +68,7 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
         return NULL;
     }
     config->coll_fd = -1;
+    config->workers = 1;
 
     config->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
 
@@ -61,7 +91,7 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
     ret = flb_input_config_map_set(i_ins, (void *)config);
     if (ret == -1) {
         flb_plg_error(i_ins, "config map set error");
-        flb_free(config);
+        fw_config_destroy(config);
         return NULL;
     }
 
@@ -87,10 +117,10 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
 
     /* Shared Key */
     if (config->empty_shared_key) {
-        if (config->shared_key) {
-            flb_sds_destroy(config->shared_key);
+        if (fw_create_empty_shared_key(config, i_ins) == -1) {
+            fw_config_destroy(config);
+            return NULL;
         }
-        config->shared_key = flb_sds_create("");
     }
 
     /* Self Hostname */
@@ -106,6 +136,11 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
 
 int fw_config_destroy(struct flb_in_fw_config *config)
 {
+    if (config->conn_mutex_initialized == FLB_TRUE) {
+        pthread_mutex_destroy(&config->conn_mutex);
+        config->conn_mutex_initialized = FLB_FALSE;
+    }
+
     if (config->log_encoder != NULL) {
         flb_log_event_encoder_destroy(config->log_encoder);
     }
@@ -120,6 +155,11 @@ int fw_config_destroy(struct flb_in_fw_config *config)
         config->coll_fd = -1;
     }
 
+    if (config->listener_registered == FLB_TRUE && config->event_loop != NULL) {
+        mk_event_del(config->event_loop, &config->listener_event);
+        config->listener_registered = FLB_FALSE;
+    }
+
     if (config->downstream != NULL) {
         flb_downstream_destroy(config->downstream);
     }
@@ -131,7 +171,7 @@ int fw_config_destroy(struct flb_in_fw_config *config)
         flb_free(config->tcp_port);
     }
 
-    flb_sds_destroy(config->shared_key);
+    fw_destroy_shared_key(config);
     flb_sds_destroy(config->self_hostname);
 
     flb_free(config);

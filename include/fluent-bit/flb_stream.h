@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -136,7 +136,8 @@ static inline int flb_stream_is_keepalive(struct flb_stream *stream)
 
 static inline int flb_stream_is_secure(struct flb_stream *stream)
 {
-    return flb_stream_get_flag_status(stream, FLB_IO_TLS);
+    return flb_stream_get_flag_status(stream, FLB_IO_TLS) ||
+           flb_stream_get_flag_status(stream, FLB_IO_DTLS);
 }
 
 static inline int flb_stream_is_thread_safe(struct flb_stream *stream)

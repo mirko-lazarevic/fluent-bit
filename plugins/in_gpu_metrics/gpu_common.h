@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2025 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,8 +23,11 @@
 #include <inttypes.h>
 #include <stddef.h>
 
+struct in_gpu_metrics;
+
 int gpu_read_uint64(const char *path, uint64_t *value);
 int gpu_read_double(const char *path, double scale, double *value);
 int gpu_read_line(const char *path, char *buf, size_t size);
+int gpu_should_include_card(struct in_gpu_metrics *ctx, int card_id);
 
 #endif

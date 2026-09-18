@@ -26,6 +26,7 @@ DEFINE_OPTION(FLB_IN_EVENT_TYPE               "Enable event type plugin"        
 DEFINE_OPTION(FLB_IN_EXEC                     "Enable Exec input plugin"                     ON)
 DEFINE_OPTION(FLB_IN_EXEC_WASI                "Enable Exec WASI input plugin"                ON)
 DEFINE_OPTION(FLB_IN_FLUENTBIT_METRICS        "Enable Fluent Bit metrics plugin"             ON)
+DEFINE_OPTION(FLB_IN_FLUENTBIT_LOGS           "Enable Fluent Bit internal logs plugin"       ON)
 DEFINE_OPTION(FLB_IN_FORWARD                  "Enable Forward input plugin"                  ON)
 DEFINE_OPTION(FLB_IN_GPU_METRICS              "Enable GPU metrics input plugin"              ON)
 DEFINE_OPTION(FLB_IN_HEAD                     "Enable Head input plugin"                     ON)
@@ -60,6 +61,7 @@ DEFINE_OPTION(FLB_IN_TCP                      "Enable TCP input plugin"         
 DEFINE_OPTION(FLB_IN_THERMAL                  "Enable Thermal plugin"                        ON)
 DEFINE_OPTION(FLB_IN_UDP                      "Enable UDP input plugin"                      ON)
 DEFINE_OPTION(FLB_IN_UNIX_SOCKET              "Enable Unix socket input plugin"              OFF)
+DEFINE_OPTION(FLB_IN_ETW                      "Enable Event Tracing for Windows input plugin" OFF)
 DEFINE_OPTION(FLB_IN_WINLOG                   "Enable Windows Log input plugin"              OFF)
 DEFINE_OPTION(FLB_IN_WINDOWS_EXPORTER_METRICS "Enable windows exporter metrics input plugin" ON)
 DEFINE_OPTION(FLB_IN_WINEVTLOG                "Enable Windows EvtLog input plugin"           OFF)
@@ -69,11 +71,13 @@ DEFINE_OPTION(FLB_IN_EBPF                     "Enable Linux eBPF input plugin"  
 # Processors
 # ==========
 DEFINE_OPTION(FLB_PROCESSOR_CONTENT_MODIFIER  "Enable content modifier processor"            ON)
+DEFINE_OPTION(FLB_PROCESSOR_CUMULATIVE_TO_DELTA "Enable cumulative to delta metrics processor" ON)
 DEFINE_OPTION(FLB_PROCESSOR_LABELS            "Enable metrics label manipulation processor"  ON)
 DEFINE_OPTION(FLB_PROCESSOR_METRICS_SELECTOR  "Enable metrics selector processor"            ON)
 DEFINE_OPTION(FLB_PROCESSOR_OPENTELEMETRY_ENVELOPE "Enable OpenTelemetry envelope processor" ON)
 DEFINE_OPTION(FLB_PROCESSOR_SQL               "Enable SQL processor"                         ON)
 DEFINE_OPTION(FLB_PROCESSOR_SAMPLING          "Enable sampling processor"                    ON)
+DEFINE_OPTION(FLB_PROCESSOR_TDA               "Enable TDA processor"                         ON)
 
 # Filters
 # =======
@@ -119,6 +123,7 @@ DEFINE_OPTION(FLB_OUT_EXIT                    "Enable Exit output plugin"       
 DEFINE_OPTION(FLB_OUT_FILE                    "Enable file output plugin"                    ON)
 DEFINE_OPTION(FLB_OUT_FLOWCOUNTER             "Enable flowcount output plugin"               ON)
 DEFINE_OPTION(FLB_OUT_FORWARD                 "Enable Forward output plugin"                 ON)
+DEFINE_OPTION(FLB_OUT_GCS                     "Enable GCS output plugin"                     ON)
 DEFINE_OPTION(FLB_OUT_GELF                    "Enable GELF output plugin"                    ON)
 DEFINE_OPTION(FLB_OUT_HTTP                    "Enable HTTP output plugin"                    ON)
 DEFINE_OPTION(FLB_OUT_IBM_LOGS                "Enable IBM Cloud Logs output plugin"          ON)
@@ -153,3 +158,4 @@ DEFINE_OPTION(FLB_OUT_TCP                     "Enable TCP output plugin"        
 DEFINE_OPTION(FLB_OUT_UDP                     "Enable UDP output plugin"                     ON)
 DEFINE_OPTION(FLB_OUT_VIVO_EXPORTER           "Enable Vivo exporter output plugin"           ON)
 DEFINE_OPTION(FLB_OUT_WEBSOCKET               "Enable Websocket output plugin"               ON)
+DEFINE_OPTION(FLB_OUT_ARVANCLOUD_CLOUDLOGS    "Enable ArvanCloud CloudLogs output plugin"    ON)

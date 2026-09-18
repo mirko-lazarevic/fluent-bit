@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2025 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@
 
 #include "gpu_metrics.h"
 #include "amd_gpu.h"
+#include "nvml_gpu.h"
 
 static int in_gpu_collect(struct flb_input_instance *ins,
                           struct flb_config *config, void *in_context)
@@ -41,7 +42,12 @@ static int in_gpu_collect(struct flb_input_instance *ins,
 
     cfl_list_foreach(head, &ctx->cards) {
         card = cfl_list_entry(head, struct gpu_card, _head);
-        amd_gpu_collect_metrics(ctx, card);
+        if (card->backend_type == GPU_BACKEND_AMD) {
+            amd_gpu_collect_metrics(ctx, card);
+        }
+        else if (card->backend_type == GPU_BACKEND_NVML) {
+            nvml_gpu_collect_metrics(ctx, card);
+        }
     }
 
     flb_input_metrics_append(ctx->ins, NULL, 0, ctx->cmt);
@@ -61,6 +67,8 @@ static int in_gpu_init(struct flb_input_instance *ins,
     }
     ctx->ins = ins;
     ctx->cards_detected = 0;
+    ctx->nvml_initialized = FLB_FALSE;
+    ctx->nvml_lib_handle = NULL;
     cfl_list_init(&ctx->cards);
 
     ret = flb_input_config_map_set(ins, (void *) ctx);
@@ -116,7 +124,21 @@ static int in_gpu_init(struct flb_input_instance *ins,
                                       "GPU fan PWM percentage", 2,
                                       (char *[]) {"card", "vendor"});
 
+    ctx->g_process_memory = cmt_gauge_create(ctx->cmt, "gpu", "", "process_memory_used_bytes",
+                                             "Per-process GPU memory in bytes", 3,
+                                             (char *[]) {"card", "vendor", "pid"});
+
+    ctx->g_mig_info = cmt_gauge_create(ctx->cmt, "gpu", "", "mig_device_info",
+                                       "MIG device metadata (always 1)", 5,
+                                       (char *[]) {"card", "vendor", "parent_uuid",
+                                                   "gpu_instance_id", "compute_instance_id"});
+
     amd_gpu_detect_cards(ctx);
+    if (nvml_gpu_initialize(ctx) == 0) {
+        if (nvml_gpu_detect_cards(ctx) != 0) {
+            flb_plg_debug(ctx->ins, "NVML card detection encountered errors");
+        }
+    }
     flb_input_set_context(ins, ctx);
 
     ret = flb_input_set_collector_time(ins, in_gpu_collect,
@@ -154,6 +176,13 @@ static int in_gpu_exit(void *data, struct flb_config *config)
         if (card->hwmon_path) {
             flb_sds_destroy(card->hwmon_path);
         }
+        if (card->uuid) {
+            flb_sds_destroy(card->uuid);
+        }
+        if (card->parent_uuid) {
+            flb_sds_destroy(card->parent_uuid);
+        }
+
         cfl_list_del(&card->_head);
         flb_free(card);
     }
@@ -162,40 +191,48 @@ static int in_gpu_exit(void *data, struct flb_config *config)
         cmt_destroy(ctx->cmt);
     }
 
+    nvml_gpu_shutdown(ctx);
     flb_free(ctx);
     return 0;
 }
 
 static struct flb_config_map config_map[] = {
     {
-     FLB_CONFIG_MAP_TIME, "scrape_interval", "5",
-     0, FLB_TRUE, offsetof(struct in_gpu_metrics, scrape_interval),
-     "Scrape interval for GPU metrics"
-    },
-    {
-     FLB_CONFIG_MAP_STR, "path_sysfs", "/sys",
-     0, FLB_TRUE, offsetof(struct in_gpu_metrics, path_sysfs),
-     "Path to sysfs"
+     FLB_CONFIG_MAP_STR, "cards_exclude", "",
+     0, FLB_TRUE, offsetof(struct in_gpu_metrics, cards_exclude),
+     "Exclude GPU cards by ID. Accepts '*' for all, comma-separated IDs "
+     "(e.g., '0,1,2'), or ranges (e.g., '0-2')."
     },
     {
      FLB_CONFIG_MAP_STR, "cards_include", "*",
      0, FLB_TRUE, offsetof(struct in_gpu_metrics, cards_include),
-     "Cards to include"
-    },
-    {
-     FLB_CONFIG_MAP_STR, "cards_exclude", "",
-     0, FLB_TRUE, offsetof(struct in_gpu_metrics, cards_exclude),
-     "Cards to exclude"
+     "Include GPU cards by ID. Accepts '*' for all, comma-separated IDs "
+     "(e.g., '0,1,2'), or ranges (e.g., '0-2')."
     },
     {
      FLB_CONFIG_MAP_BOOL, "enable_power", "true",
      0, FLB_TRUE, offsetof(struct in_gpu_metrics, enable_power),
-     "Enable power metrics"
+     "Enable collection of GPU power consumption metrics (gpu_power_watts)."
     },
     {
      FLB_CONFIG_MAP_BOOL, "enable_temperature", "true",
      0, FLB_TRUE, offsetof(struct in_gpu_metrics, enable_temperature),
-     "Enable temperature metrics"
+     "Enable collection of GPU temperature metrics (gpu_temperature_celsius)."
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "enable_nvml", "true",
+     0, FLB_TRUE, offsetof(struct in_gpu_metrics, enable_nvml),
+     "Enable NVIDIA NVML collection when libnvidia-ml is available."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "path_sysfs", "/sys",
+     0, FLB_TRUE, offsetof(struct in_gpu_metrics, path_sysfs),
+     "sysfs mount point."
+    },
+    {
+     FLB_CONFIG_MAP_TIME, "scrape_interval", "5",
+     0, FLB_TRUE, offsetof(struct in_gpu_metrics, scrape_interval),
+     "Scrape interval to collect GPU metrics."
     },
     {0}
 };

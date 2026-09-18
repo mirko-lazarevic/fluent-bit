@@ -22,20 +22,46 @@
 #define FLB_WINEVTLOG_H
 
 #include <winevt.h>
+#include <fluent-bit/flb_hash_table.h>
 #include <fluent-bit/flb_log_event_encoder.h>
 #include <fluent-bit/flb_input_plugin.h>
 
 struct winevtlog_session;
+
+struct winevtlog_event_template {
+    PWSTR provider_name;
+    DWORD event_id;
+    DWORD version;
+    PWSTR *data_names;
+    char *cache_key;
+    size_t cache_key_length;
+    UINT data_count;
+    int valid;
+    struct mk_list _head;
+};
+
+/* reconnect backoff */
+struct winevtlog_backoff {
+    DWORD base_ms;
+    DWORD max_ms;
+    DWORD multiplier_x1000;
+    DWORD jitter_pct;
+    DWORD max_retries;
+};
 
 struct winevtlog_config {
     unsigned int interval_sec;
     unsigned int interval_nsec;
     size_t total_size_threshold;
     int string_inserts;
+    int event_data_as_map;
+    int event_template_cache_size;
     int read_existing_events;
     int render_event_as_xml;
+    int render_event_as_text;
     int use_ansi;
     int ignore_missing_channels;
+    flb_sds_t render_event_text_key;
     flb_sds_t event_query;
     flb_sds_t remote_server;
     flb_sds_t remote_domain;
@@ -48,6 +74,10 @@ struct winevtlog_config {
     flb_pipefd_t coll_fd;
     struct flb_input_instance *ins;
     struct flb_log_event_encoder *log_encoder;
+    struct flb_hash_table *event_template_cache;
+    struct mk_list event_templates;
+    struct winevtlog_backoff backoff;
+    flb_sds_t backoff_multiplier_str;
 };
 
 /* Some channels has very heavy contents for 10 events at same time.
@@ -63,6 +93,14 @@ struct winevtlog_channel {
     EVT_HANDLE events[SUBSCRIBE_ARRAY_SIZE];
     int count;
     struct winevtlog_session *session;
+
+    /* reconnect */
+    BOOL   cancelled_by_us;
+    BOOL   reconnect_needed;
+    DWORD  last_error;
+    DWORD  retry_attempts;
+    ULONGLONG next_retry_deadline;
+    ULONGLONG prng_state;
 
     char *name;
     char *query;
@@ -112,17 +150,36 @@ struct mk_list *winevtlog_open_all(const char *channels, struct winevtlog_config
 void winevtlog_close_all(struct mk_list *list);
 
 void winevtlog_pack_xml_event(WCHAR *system_xml, WCHAR *message,
-                              PEVT_VARIANT string_inserts, UINT count_inserts, struct winevtlog_channel *ch,
+                              PEVT_VARIANT string_inserts, UINT count_inserts,
+                              struct winevtlog_event_template *event_template,
+                              struct winevtlog_channel *ch,
                               struct winevtlog_config *ctx);
+void winevtlog_pack_text_event(PEVT_VARIANT system, WCHAR *message,
+                               PEVT_VARIANT string_inserts, UINT count_inserts,
+                               struct winevtlog_event_template *event_template,
+                               struct winevtlog_channel *ch,
+                               struct winevtlog_config *ctx);
 void winevtlog_pack_event(PEVT_VARIANT system, WCHAR *message,
-                          PEVT_VARIANT string_inserts, UINT count_inserts, struct winevtlog_channel *ch,
+                          PEVT_VARIANT string_inserts, UINT count_inserts,
+                          struct winevtlog_event_template *event_template,
+                          struct winevtlog_channel *ch,
                           struct winevtlog_config *ctx);
+
+struct winevtlog_event_template *winevtlog_event_template_get(
+        PEVT_VARIANT system, EVT_HANDLE remote,
+        struct winevtlog_config *ctx);
+void winevtlog_event_template_cache_destroy(struct winevtlog_config *ctx);
 
 /*
  * Save the read offset to disk.
  */
 int winevtlog_sqlite_load(struct winevtlog_channel *ch, struct winevtlog_config *ctx, struct flb_sqldb *db);
 int winevtlog_sqlite_save(struct winevtlog_channel *ch, struct winevtlog_config *ctx, struct flb_sqldb *db);
+
+/* Non blocking reconnection utilities */
+int   winevtlog_try_reconnect(struct winevtlog_channel *ch, struct winevtlog_config *ctx);
+void  winevtlog_schedule_retry(struct winevtlog_channel *ch, struct winevtlog_config *ctx);
+void  winevtlog_request_cancel(struct winevtlog_channel *ch);
 
 /*
  * SQL templates

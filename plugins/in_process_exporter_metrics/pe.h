@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2023 The Fluent Bit Authors
+ *  Copyright (C) 2023-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@ struct flb_pe {
     /* configuration */
     flb_sds_t path_procfs;
     int scrape_interval;
+    int page_size;
 
     int coll_fd;                    /* collector fd     */
     struct cmt *cmt;                /* cmetrics context */

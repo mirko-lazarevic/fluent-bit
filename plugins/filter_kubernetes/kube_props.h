@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,8 +37,8 @@
 struct flb_kube_props {
     flb_sds_t stdout_parser; /* suggested parser for stdout */
     flb_sds_t stderr_parser; /* suggested parser for stderr */
-    int stdout_exclude;      /* bool: exclude stdout logs ? */
-    int stderr_exclude;      /* bool: exclude stderr logs ? */
+    int stdout_exclude;      /* tri-state: inherit, include, or exclude stdout */
+    int stderr_exclude;      /* tri-state: inherit, include, or exclude stderr */
 };
 
 #endif
