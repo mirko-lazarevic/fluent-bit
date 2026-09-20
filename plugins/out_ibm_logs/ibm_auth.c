@@ -15,12 +15,44 @@ static const char *IAM_ENDPOINT_PRODUCTION = "https://iam.cloud.ibm.com/identity
 static const char *GRANT_TYPE_APIKEY_STR = "urn:ibm:params:oauth:grant-type:apikey";
 static const char *GRANT_TYPE_CR_TOKEN_STR = "urn:ibm:params:oauth:grant-type:cr-token";
 
+/* Free all fields of an auth context without freeing the struct itself */
+static void ibm_auth_context_free_fields(struct ibm_auth_context *auth)
+{
+    if (!auth) {
+        return;
+    }
+
+    if (auth->bearer_token) {
+        memset(auth->bearer_token, 0, MAX_TOKEN_SIZE);
+        flb_free(auth->bearer_token);
+        auth->bearer_token = NULL;
+    }
+    if (auth->iam_endpoint) {
+        flb_free(auth->iam_endpoint);
+        auth->iam_endpoint = NULL;
+    }
+    if (auth->grant_type) {
+        flb_free(auth->grant_type);
+        auth->grant_type = NULL;
+    }
+    if (auth->auth_value) {
+        memset(auth->auth_value, 0, auth->auth_value_len);
+        flb_free(auth->auth_value);
+        auth->auth_value = NULL;
+    }
+    if (auth->cr_token_path) {
+        flb_free(auth->cr_token_path);
+        auth->cr_token_path = NULL;
+    }
+}
+
 /* Initialize authentication context in global arena */
 int ibm_auth_init(struct flb_ibm_logs *ctx)
 {
     struct ibm_auth_context *auth;
     const char *api_key_env;
     size_t api_key_len;
+    size_t profile_id_len;
 
     if (!ctx) {
         return -1;
@@ -42,92 +74,111 @@ int ibm_auth_init(struct flb_ibm_logs *ctx)
         auth->iam_endpoint = flb_strdup(IAM_ENDPOINT_PRODUCTION);
     } else {
         flb_plg_error(ctx->ins, "Invalid IBM IAM environment: %s", ctx->ibm_iam_env);
-        return -1;
+        goto error;
     }
 
     if (!auth->iam_endpoint) {
         flb_plg_error(ctx->ins, "failed to allocate IAM endpoint");
-        return -1;
+        goto error;
     }
 
     /* Setup grant type based on auth mode */
     if (strcasecmp(ctx->ibm_iam_authentication_mode, IBM_AUTH_MODE_APIKEY) == 0) {
         auth->grant_type = flb_strdup(GRANT_TYPE_APIKEY_STR);
+        if (!auth->grant_type) {
+            flb_plg_error(ctx->ins, "failed to allocate grant type");
+            goto error;
+        }
         auth->grant_type_len = strlen(GRANT_TYPE_APIKEY_STR);
 
         /* Get and validate API key from environment */
         api_key_env = getenv(IBM_IAM_API_KEY);
         if (!api_key_env) {
             flb_plg_error(ctx->ins, "'%s' env variable not set", IBM_IAM_API_KEY);
-            return -1;
+            goto error;
         }
-        
+
         api_key_len = strlen(api_key_env);
         if (api_key_len == 0 || api_key_len > MAX_API_KEY_SIZE) {
             flb_plg_error(ctx->ins, "Invalid API key length: %zu", api_key_len);
-            return -1;
+            goto error;
         }
 
-        /* Store API key in global arena */
+        /* Store API key */
         auth->auth_value = flb_strdup(api_key_env);
         if (!auth->auth_value) {
             flb_plg_error(ctx->ins, "failed to allocate API key");
-            return -1;
+            goto error;
         }
         auth->auth_value_len = api_key_len;
 
         flb_plg_info(ctx->ins, "configured API key authentication");
 
-    } else if (strcasecmp(ctx->ibm_iam_authentication_mode, IBM_AUTH_MODE_TRUSTED_PROFILE) == 0) {
+    } else if (strcasecmp(ctx->ibm_iam_authentication_mode,
+                          IBM_AUTH_MODE_TRUSTED_PROFILE) == 0) {
         auth->grant_type = flb_strdup(GRANT_TYPE_CR_TOKEN_STR);
+        if (!auth->grant_type) {
+            flb_plg_error(ctx->ins, "failed to allocate grant type");
+            goto error;
+        }
         auth->grant_type_len = strlen(GRANT_TYPE_CR_TOKEN_STR);
 
-        /* Validate and store profile ID */
-        if (!ctx->ibm_iam_trusted_profile_id || 
-            strlen(ctx->ibm_iam_trusted_profile_id) == 0 ||
-            strlen(ctx->ibm_iam_trusted_profile_id) > MAX_PROFILE_ID_SIZE) {
+        /* Validate and store profile ID - measure once */
+        if (!ctx->ibm_iam_trusted_profile_id) {
             flb_plg_error(ctx->ins, "Invalid trusted profile ID");
-            return -1;
+            goto error;
+        }
+        profile_id_len = strlen(ctx->ibm_iam_trusted_profile_id);
+        if (profile_id_len == 0 || profile_id_len > MAX_PROFILE_ID_SIZE) {
+            flb_plg_error(ctx->ins, "Invalid trusted profile ID length: %zu",
+                          profile_id_len);
+            goto error;
         }
 
         auth->auth_value = flb_strdup(ctx->ibm_iam_trusted_profile_id);
         if (!auth->auth_value) {
             flb_plg_error(ctx->ins, "failed to allocate profile ID");
-            return -1;
+            goto error;
         }
-        auth->auth_value_len = strlen(ctx->ibm_iam_trusted_profile_id);
+        auth->auth_value_len = profile_id_len;
 
         /* Validate and store CR token path */
         if (!ctx->cr_token_mount_path || strlen(ctx->cr_token_mount_path) == 0) {
             flb_plg_error(ctx->ins, "CR token mount path not configured");
-            return -1;
+            goto error;
         }
 
         auth->cr_token_path = flb_strdup(ctx->cr_token_mount_path);
         if (!auth->cr_token_path) {
             flb_plg_error(ctx->ins, "failed to allocate CR token path");
-            return -1;
+            goto error;
         }
 
         flb_plg_info(ctx->ins, "Configured trusted profile authentication");
 
     } else {
-        flb_plg_error(ctx->ins, "Invalid IBM auth mode: %s", ctx->ibm_iam_authentication_mode);
-        return -1;
+        flb_plg_error(ctx->ins, "Invalid IBM auth mode: %s",
+                      ctx->ibm_iam_authentication_mode);
+        goto error;
     }
 
-    /* Pre-allocate token buffer in global arena */
+    /* Pre-allocate token buffer */
     auth->bearer_token = flb_calloc(1, MAX_TOKEN_SIZE);
     if (!auth->bearer_token) {
         flb_plg_error(ctx->ins, "failed to allocate token buffer");
-        return -1;
+        goto error;
     }
 
-    /* Initialize with empty token */
     auth->bearer_token[0] = '\0';
     auth->token_expiry = 0;
 
     return 0;
+
+error:
+    ibm_auth_context_free_fields(auth);
+    flb_free(auth);
+    ctx->auth = NULL;
+    return -1;
 }
 
 /* Get or refresh authentication token */
@@ -251,6 +302,7 @@ cleanup:
 int ibm_auth_refresh_if_needed(struct flb_ibm_logs *ctx,
                                struct flb_config *config)
 {
+    int need_refresh = 0;
     int ret = 0;
     struct ibm_auth_context *auth;
     time_t current_time;
@@ -261,25 +313,28 @@ int ibm_auth_refresh_if_needed(struct flb_ibm_logs *ctx,
 
     auth = ctx->auth;
 
-    /* Check if we have a token */
-    if (strlen(auth->bearer_token) == 0) {
-        flb_plg_debug(ctx->ins, "no token available, requesting new one");
-        return ibm_auth_get_token(ctx, config);
-    }
-
     pthread_mutex_lock(&ctx->auth_mutex);
-    
-    /* Check if token is expired or about to expire */
+
     current_time = time(NULL);
-    if (current_time >= (auth->token_expiry - TOKEN_REFRESH_THRESHOLD_SECONDS)) {
-        flb_plg_debug(ctx->ins, "token expired or expiring soon, refreshing");
-        ret = ibm_auth_get_token(ctx, config);
+    if (auth->bearer_token[0] == '\0' ||
+        current_time >= (auth->token_expiry - TOKEN_REFRESH_THRESHOLD_SECONDS)) {
+        need_refresh = 1;
+        if (auth->bearer_token[0] == '\0') {
+            flb_plg_debug(ctx->ins, "no token available, requesting new one");
+        } else {
+            flb_plg_debug(ctx->ins, "token expired or expiring soon, refreshing");
+        }
     } else {
-        flb_plg_debug(ctx->ins, "token valid for %ld more seconds", 
-                     auth->token_expiry - current_time);
+        flb_plg_debug(ctx->ins, "token valid for %ld more seconds",
+                      auth->token_expiry - current_time);
     }
 
     pthread_mutex_unlock(&ctx->auth_mutex);
+
+    /* network call happens outside the lock */
+    if (need_refresh) {
+        ret = ibm_auth_get_token(ctx, config);
+    }
 
     return ret;
 }
@@ -287,33 +342,21 @@ int ibm_auth_refresh_if_needed(struct flb_ibm_logs *ctx,
 /* Cleanup authentication */
 void ibm_auth_cleanup(struct flb_ibm_logs *ctx)
 {
-    if (ctx && ctx->auth && ctx->auth->bearer_token) {
-        /* Securely clear sensitive data */
-        memset(ctx->auth->bearer_token, 0, MAX_TOKEN_SIZE);
-        flb_free(ctx->auth->bearer_token);
-        ctx->auth->bearer_token = NULL;
+    if (!ctx) {
+        return;
     }
 
-    if (ctx && ctx->cr_token_buffer) {
-        /* Securely clear sensitive data */
-        memset(ctx->cr_token_buffer, 0, MAX_CR_TOKEN_SIZE);
-        flb_free(ctx->cr_token_buffer);
-    }
-
-    if (ctx->auth->iam_endpoint) {
-        flb_free(ctx->auth->iam_endpoint);
-    }
-    
-    if (ctx->auth->grant_type) {
-        flb_free(ctx->auth->grant_type);
-    }
-    
-    if (ctx->auth->cr_token_path) {
-        flb_free(ctx->auth->cr_token_path);
-    }
-
-    if (ctx && ctx->auth) {
+    /* guard ctx->auth consistently before every dereference */
+    if (ctx->auth) {
+        ibm_auth_context_free_fields(ctx->auth);
         flb_free(ctx->auth);
         ctx->auth = NULL;
+    }
+
+    /* cr_token_buffer lives in flb_ibm_logs, not ibm_auth_context */
+    if (ctx->cr_token_buffer) {
+        memset(ctx->cr_token_buffer, 0, MAX_CR_TOKEN_SIZE);
+        flb_free(ctx->cr_token_buffer);
+        ctx->cr_token_buffer = NULL;
     }
 }

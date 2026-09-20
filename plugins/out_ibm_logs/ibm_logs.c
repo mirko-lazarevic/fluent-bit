@@ -52,7 +52,9 @@ int flb_ibm_logs_conf_destroy(struct flb_ibm_logs *ctx)
         return -1;
     }
 
-    /* Destroy string fields */
+    /* release auth context and cr_token_buffer before freeing ctx */
+    ibm_auth_cleanup(ctx);
+
     if (ctx->ibm_logs_host) {
         flb_sds_destroy(ctx->ibm_logs_host);
     }
@@ -73,7 +75,6 @@ int flb_ibm_logs_conf_destroy(struct flb_ibm_logs *ctx)
         flb_upstream_destroy(ctx->upstream);
     }
 
-    /* Destroy mutex */
     pthread_mutex_destroy(&ctx->auth_mutex);
 
     flb_free(ctx);
@@ -511,6 +512,7 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
                                                 const char *tag, int tag_len,
                                                 size_t last_offset,
                                                 size_t threshold, size_t *out_offset,
+                                                int *out_record_count,
                                                 struct flb_log_event_decoder *log_decoder)
 {
     int ret;
@@ -563,13 +565,13 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
         msgpack_object *kubernetes_map = NULL;
         const char *file_path = NULL;
         int file_path_len = 0;
-        
+
         /* Reset per-iteration variables */
         app_name_to_use = NULL;
         subsystem_name_to_use = NULL;
         should_free_app_name = 0;
         should_free_subsystem_name = 0;
-        
+
         /* Count and identify fields in first pass */
         for (i = 0; i < log_event.body->via.map.size; i++) {
             k = log_event.body->via.map.ptr[i].key;
@@ -577,10 +579,10 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
 
             /* Check for kubernetes metadata */
             if (k.type == MSGPACK_OBJECT_STR &&
-                k.via.str.size == FIELD_KUBERNETES_LEN && 
+                k.via.str.size == FIELD_KUBERNETES_LEN &&
                 memcmp(k.via.str.ptr, FIELD_KUBERNETES, FIELD_KUBERNETES_LEN) == 0) {
                 if (v.type == MSGPACK_OBJECT_MAP) {
-                    kubernetes_map = &v;
+                    kubernetes_map = &log_event.body->via.map.ptr[i].val;
                 }
             }
             /* Check for file field */
@@ -705,8 +707,13 @@ static flb_sds_t ibm_cloud_logs_compose_payload(struct flb_ibm_logs *ctx,
     }
 
     *out_offset = last_off;
+    /* surface the record count so the caller can update statistics
+     * without re-scanning the decoder (which would corrupt its state). */
+    if (out_record_count) {
+        *out_record_count = record_count;
+    }
 
-    json = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size);
+    json = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size, FLB_FALSE);
     if (!json) {
         flb_plg_error(ctx->ins, "Failed to convert msgpack to JSON");
         goto error;
@@ -740,6 +747,7 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
     int result;
     int ret_code = FLB_RETRY;
     size_t payload_len;
+    int records_sent = 0; /* populated by compose_payload */
     flb_sds_t payload = NULL;
     size_t b_sent;
     struct flb_ibm_logs *ctx = out_context;
@@ -789,12 +797,14 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
         }
 
         /* Format the data chunk */
-        payload = ibm_cloud_logs_compose_payload(ctx, 
+        records_sent = 0;
+        payload = ibm_cloud_logs_compose_payload(ctx,
                                                  event_chunk->data,
                                                  event_chunk->size,
                                                  event_chunk->tag,
                                                  flb_sds_len(event_chunk->tag),
                                                  offset, threshold, &out_offset,
+                                                 &records_sent,
                                                  &log_decoder);
         
         if (!payload) {
@@ -843,8 +853,14 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
             goto cleanup;
         }
 
-        /* Add headers */
+        /*
+         * bearer_token is written by ibm_auth_get_token under no lock;
+         * reads here must also be protected by the mutex so we do not observe
+         * a partial write from a concurrent token refresh.
+         */
+        pthread_mutex_lock(&ctx->auth_mutex);
         flb_http_bearer_auth(http_client, ctx->auth->bearer_token);
+        pthread_mutex_unlock(&ctx->auth_mutex);
         flb_http_add_header(http_client, "Content-Type", 12, "application/json", 16);
 
         /* Perform HTTP request */
@@ -887,11 +903,7 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
             else {
                 /* Success */
                 ret_code = FLB_OK;
-                
-                /* Update statistics */
-                int chunk_count = count_logs_with_threshold(offset, threshold, 
-                                                            &log_decoder, ctx);
-                ctx->total_logs_sent += chunk_count;
+                ctx->total_logs_sent += (uint64_t)records_sent;
                 ctx->total_bytes_sent += payload_len;
             }
         }
@@ -952,15 +964,8 @@ static int cb_ibm_logs_exit(void *data, struct flb_config *config)
     flb_plg_info(ctx->ins, "  Total flushes: %llu", ctx->flush_count);
     flb_plg_info(ctx->ins, "  Auth refreshes: %llu", ctx->auth_refresh_count);
 
-    /* Clear sensitive auth data */
-    ibm_auth_cleanup(ctx);
+    flb_ibm_logs_conf_destroy(ctx);
 
-    /* Destroy mutex */
-    pthread_mutex_destroy(&ctx->auth_mutex);
-
-    /* Free context */
-    flb_free(ctx);
-    
     return 0;
 }
 
