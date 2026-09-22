@@ -17,6 +17,8 @@
  *  limitations under the License.
  */
 
+#include <ctype.h>
+
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_mp.h>
 #include <fluent-bit/flb_pack.h>
@@ -250,95 +252,89 @@ static char* parse_container_from_path(struct flb_ibm_logs *ctx,
                                        int file_path_len)
 {
     const char *container_start;
-    const char *container_end;
     char *last_hyphen;
     int container_len;
+    int container_offset;
+    int search_end;
     char *result;
-    int underscore_count = 0;
     int i;
-    
+
     /* Validate input */
     if (!file_path || file_path_len <= (K8S_LOG_PATH_PREFIX_LEN + K8S_LOG_SUFFIX_LEN)) {
         return NULL;
     }
-    
+
     /* Check prefix and suffix */
     if (memcmp(file_path, K8S_LOG_PATH_PREFIX, K8S_LOG_PATH_PREFIX_LEN) != 0) {
         return NULL;
     }
-    
-    if (memcmp(file_path + file_path_len - K8S_LOG_SUFFIX_LEN, 
+
+    if (memcmp(file_path + file_path_len - K8S_LOG_SUFFIX_LEN,
                K8S_LOG_SUFFIX, K8S_LOG_SUFFIX_LEN) != 0) {
         return NULL;
     }
-    
-    /* Find the second underscore */
-    container_start = (char *)(file_path + K8S_LOG_PATH_PREFIX_LEN);
-    for (i = 0; i < file_path_len - K8S_LOG_PATH_PREFIX_LEN; i++) {
-        if (container_start[i] == '_') {
-            underscore_count++;
-            if (underscore_count == 2) {
-                container_start = &container_start[i + 1];
-                break;
-            }
-        }
-    }
-    
-    if (underscore_count != 2) {
+
+    /* Find the first underscore (end of pod name) */
+    container_start = memchr(file_path + K8S_LOG_PATH_PREFIX_LEN, '_',
+                             file_path_len - K8S_LOG_PATH_PREFIX_LEN);
+    if (!container_start) {
         return NULL;
     }
-    
+
+    /* Find the second underscore (end of namespace) */
+    container_start = memchr(container_start + 1, '_',
+                             file_path_len - (container_start + 1 - file_path));
+    if (!container_start) {
+        return NULL;
+    }
+    container_start++; /* advance past the second underscore */
+
     /* Find last hyphen before .log */
+    search_end = file_path_len - K8S_LOG_SUFFIX_LEN - 1;
+    container_offset = (int)(container_start - file_path);
     last_hyphen = NULL;
-    for (i = file_path_len - K8S_LOG_SUFFIX_LEN - 1; 
-         i >= (container_start - file_path); i--) {
+    for (i = search_end; i >= container_offset; i--) {
         if (file_path[i] == '-') {
             last_hyphen = (char *)&file_path[i];
             break;
         }
     }
-    
+
     if (!last_hyphen || last_hyphen <= container_start) {
         return NULL;
     }
-    
-    container_end = last_hyphen;
-    container_len = container_end - container_start;
-    
+
+    container_len = last_hyphen - container_start;
+
     /* Validate container name length */
     if (container_len <= 0 || container_len > K8S_CONTAINER_MAX_LEN) {
         return NULL;
     }
-    
+
     /* Check if it's just a container ID (64 hex chars) */
     if (container_len == K8S_CONTAINER_ID_LEN) {
-        int is_hex = 1;
         for (i = 0; i < container_len; i++) {
-            char c = container_start[i];
-            if (!((c >= '0' && c <= '9') || 
-                  (c >= 'a' && c <= 'f') || 
-                  (c >= 'A' && c <= 'F'))) {
-                is_hex = 0;
+            if (!isxdigit((unsigned char)container_start[i])) {
                 break;
             }
         }
-        if (is_hex) {
-            flb_plg_debug(ctx->ins, 
-                         "Path appears to contain only container ID without name");
+        if (i == container_len) {
+            flb_plg_debug(ctx->ins,
+                          "Path appears to contain only container ID without name");
             return NULL;
         }
     }
-    
+
     /* Allocate and copy container name */
     result = flb_sds_create_len(container_start, container_len);
     if (!result) {
         flb_plg_error(ctx->ins, "Failed to allocate container name from path");
     } else {
-        flb_plg_debug(ctx->ins, 
-                     "Parsed container name from path: '%s' (length: %d)", 
-                     result, container_len);
+        flb_plg_debug(ctx->ins,
+                      "Parsed container name from path: '%s' (length: %d)",
+                      result, container_len);
     }
-    
+
     return result;
 }
 
