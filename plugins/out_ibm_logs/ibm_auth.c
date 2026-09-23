@@ -5,6 +5,10 @@
 #include <fluent-bit/flb_oauth2.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_sds.h>
+#ifdef FLB_HAVE_METRICS
+#include <cmetrics/cmt_counter.h>
+#include <cfl/cfl_time.h>
+#endif
 
 #include "ibm_logs.h"
 #include "ibm_auth.h"
@@ -294,6 +298,14 @@ cleanup:
     if (oauth2_ctx) {
         flb_oauth2_destroy(oauth2_ctx);
     }
+
+#ifdef FLB_HAVE_METRICS
+    if (ctx->cmt_iam_requests) {
+        uint64_t ts = cfl_time_now();
+        cmt_counter_inc(ctx->cmt_iam_requests, ts, 1,
+                        (char *[]) {result == 0 ? "success" : "failure"});
+    }
+#endif
 
     return result;
 }

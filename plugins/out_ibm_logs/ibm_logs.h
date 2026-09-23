@@ -28,6 +28,9 @@
 
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_sds.h>
+#ifdef FLB_HAVE_METRICS
+#include <cmetrics/cmt_counter.h>
+#endif
 
 /* Token and buffer sizes */
 #define MAX_TOKEN_SIZE       (8 * 1024)      /* 8KB for bearer token */
@@ -94,6 +97,11 @@ struct flb_ibm_logs {
     uint64_t total_bytes_sent;
     uint64_t flush_count;
     uint64_t auth_refresh_count;
+
+#ifdef FLB_HAVE_METRICS
+    /* CMetrics counter: total IBM IAM token requests by result (success|failure) */
+    struct cmt_counter *cmt_iam_requests;
+#endif
 
     /* Plugin instance reference */
     struct flb_output_instance *ins;

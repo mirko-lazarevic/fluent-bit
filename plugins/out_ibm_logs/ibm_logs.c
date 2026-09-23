@@ -24,6 +24,10 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_router.h>
+#ifdef FLB_HAVE_METRICS
+#include <cfl/cfl_time.h>
+#endif
 
 #include "ibm_logs.h"
 #include "ibm_auth.h"
@@ -171,6 +175,20 @@ static int cb_ibm_logs_init(struct flb_output_instance *ins,
         flb_plg_error(ins, "failed to initialize authentication");
         goto error;
     }
+
+#ifdef FLB_HAVE_METRICS
+    /*
+     * Register the IAM requests counter before the initial token fetch so
+     * that the very first ibm_auth_get_token() call is counted correctly.
+     */
+    ctx->cmt_iam_requests = cmt_counter_create(ins->cmt,
+                                               "fluentbit",
+                                               "ibm_logs",
+                                               "iam_requests_total",
+                                               "Total number of IBM IAM token "
+                                               "requests.",
+                                               1, (char *[]) {"result"});
+#endif
 
     /* Get initial token */
     ret = ibm_auth_get_token(ctx, config);
@@ -733,6 +751,85 @@ error:
     return NULL;
 }
 
+#ifdef FLB_HAVE_METRICS
+/*
+ * Parse the IBM Cloud Logs 2xx response body for a server-side drop count.
+ *
+ * IBM Cloud Logs returns a JSON body like:
+ *   {"message":"OK","details":"Dropped 3 log entries: 3 log record(s) older than ..."}
+ * when it silently drops records on its end despite returning a 2xx status.
+ *
+ * The function scans the raw payload for the "details" key and extracts the
+ * record count from the pattern "log entries: N log record".
+ *
+ * Returns the number of dropped records, or 0 if none / not parseable.
+ */
+static int parse_dropped_records(struct flb_ibm_logs *ctx,
+                                 struct flb_http_client *c)
+{
+    const char *payload_end;
+    const char *p;
+    const char *details_start;
+    int dropped = 0;
+
+    if (!c || c->resp.payload_size == 0 || !c->resp.payload) {
+        return 0;
+    }
+
+    payload_end = c->resp.payload + c->resp.payload_size;
+
+    /*
+     * Fast pre-check: both markers must be present.
+     * "Dropped" confirms a drop event; "\"details\"" is the JSON key that
+     * carries the count.  Either absent means nothing to parse.
+     */
+    if (!strstr(c->resp.payload, "Dropped") ||
+        !strstr(c->resp.payload, "\"details\"")) {
+        return 0;
+    }
+
+    /*
+     * Locate the "details" JSON string value.  Walk past the key, the
+     * colon, any whitespace, and the opening quote of the string value.
+     *
+     * Example payload:
+     *   {"message":"OK","details":"Dropped 3 log entries: 3 log record(s)..."}
+     */
+    p = strstr(c->resp.payload, "\"details\"");
+    /* already confirmed non-NULL above */
+
+    p += 9; /* len("\"details\"") */
+    while (p < payload_end && (*p == ' ' || *p == ':' || *p == '\t')) {
+        p++;
+    }
+    if (p >= payload_end || *p != '"') {
+        return 0;
+    }
+    details_start = p + 1;
+
+    /*
+     * Extract the dropped record count from "log entries: N log record".
+     * The number before "log entries:" is the entry count (may differ);
+     * the number after it is the individual log record count we want.
+     */
+    p = strstr(details_start, "log entries: ");
+    if (!p || (p + 13) >= payload_end) {
+        return 0;
+    }
+    p += 13; /* len("log entries: ") */
+
+    if (sscanf(p, "%d", &dropped) != 1 || dropped <= 0) {
+        return 0;
+    }
+
+    flb_plg_warn(ctx->ins,
+                 "IBM Cloud Logs dropped %d record(s) server-side "
+                 "(2xx with partial drop)", dropped);
+
+    return dropped;
+}
+#endif /* FLB_HAVE_METRICS */
+
 /* Enhanced flush callback */
 static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
                             struct flb_output_flush *out_flush,
@@ -877,13 +974,28 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
                 if (http_client->resp.status == 401) {
                     flb_plg_error(ctx->ins, "authentication failed (401), will retry with token refresh");
                     ctx->auth->token_expiry = 0;
+                    if (http_client->resp.payload_size > 0) {
+                        flb_plg_debug(ctx->ins, "server response: %.*s",
+                                      (int)http_client->resp.payload_size,
+                                      http_client->resp.payload);
+                    }
                     ret_code = FLB_RETRY;
                 } else if (http_client->resp.status == 429) {
                     flb_plg_warn(ctx->ins, "rate limited (429), will retry");
+                    if (http_client->resp.payload_size > 0) {
+                        flb_plg_debug(ctx->ins, "server response: %.*s",
+                                      (int)http_client->resp.payload_size,
+                                      http_client->resp.payload);
+                    }
                     ret_code = FLB_RETRY;
                 } else if (http_client->resp.status >= 500) {
-                    flb_plg_warn(ctx->ins, "server error (status=%d), will retry", 
+                    flb_plg_warn(ctx->ins, "server error (status=%d), will retry",
                                 http_client->resp.status);
+                    if (http_client->resp.payload_size > 0) {
+                        flb_plg_warn(ctx->ins, "server response body: %.*s",
+                                     (int)http_client->resp.payload_size,
+                                     http_client->resp.payload);
+                    }
                     ret_code = FLB_RETRY;
                 } else {
                     flb_plg_error(ctx->ins, "unexpected HTTP status=%d", 
@@ -898,9 +1010,44 @@ static void cb_ibm_logs_flush(struct flb_event_chunk *event_chunk,
             }
             else {
                 /* Success */
+                flb_plg_debug(ctx->ins, "HTTP status=%d", http_client->resp.status);
+                if (http_client->resp.payload_size > 0) {
+                    flb_plg_warn(ctx->ins, "server response body: %.*s",
+                                    (int)http_client->resp.payload_size,
+                                    http_client->resp.payload);
+                }
                 ret_code = FLB_OK;
                 ctx->total_logs_sent += (uint64_t)records_sent;
                 ctx->total_bytes_sent += payload_len;
+
+#ifdef FLB_HAVE_METRICS
+                {
+                    int srv_dropped;
+
+                    srv_dropped = parse_dropped_records(ctx, http_client);
+                    if (srv_dropped > 0) {
+                        uint64_t ts = cfl_time_now();
+
+                        cmt_counter_add(ctx->ins->cmt_dropped_records,
+                                        ts, srv_dropped,
+                                        1, (char *[]) {
+                                            (char *) flb_output_name(ctx->ins)
+                                        });
+
+                        if (out_flush->config->router != NULL &&
+                            event_chunk->type == FLB_EVENT_TYPE_LOGS) {
+                            cmt_counter_add(
+                                out_flush->config->router->logs_drop_records_total,
+                                ts, srv_dropped,
+                                2, (char *[]) {
+                                    (char *) flb_input_name(
+                                                 out_flush->task->i_ins),
+                                    (char *) flb_output_name(ctx->ins)
+                                });
+                        }
+                    }
+                }
+#endif
             }
         }
 
